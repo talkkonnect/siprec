@@ -1,0 +1,1149 @@
+package sip
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"strings"
+	"sync"
+	"time"
+
+	"siprec-server/pkg/auth"
+	"siprec-server/pkg/cdr"
+	"siprec-server/pkg/cluster"
+	"siprec-server/pkg/errors"
+	"siprec-server/pkg/media"
+	"siprec-server/pkg/metrics"
+	"siprec-server/pkg/realtime/analytics"
+	sessions "siprec-server/pkg/session"
+	"siprec-server/pkg/siprec"
+	"siprec-server/pkg/stt"
+	"siprec-server/pkg/telemetry/tracing"
+
+	"github.com/sirupsen/logrus"
+)
+
+type SessionStore interface {
+	// Save stores a call data by key
+	Save(key string, data *CallData) error
+
+	// Load retrieves call data by key
+	Load(key string) (*CallData, error)
+
+	// Delete removes call data by key
+	Delete(key string) error
+
+	// List returns all stored keys
+	List() ([]string, error)
+}
+
+// Config for the SIP handler
+type Config struct {
+	// Maximum concurrent calls allowed
+	MaxConcurrentCalls int
+
+	// Media configuration
+	MediaConfig *media.Config
+
+	// SIP ports for proper NAT configuration
+	SIPPorts []int
+
+	// NAT configuration for SIP header rewriting
+	NATConfig *NATConfig
+
+	// Shared session store backing both SIP handler and session manager
+	SessionStore sessions.SessionStore
+
+	// Node identifier used when persisting sessions (optional)
+	SessionNodeID string
+
+	// Redundancy-related configuration
+	RedundancyEnabled    bool
+	SessionTimeout       time.Duration
+	SessionCheckInterval time.Duration
+
+	// Storage type for redundancy (memory, redis)
+	RedundancyStorageType string
+
+	// Number of shards for concurrent session handling
+	// Higher values reduce lock contention but increase memory usage
+	// Must be a power of 2 (16, 32, 64, etc.)
+	ShardCount int
+
+	// HTTP endpoints that should receive metadata lifecycle notifications
+	MetadataCallbackURLs []string
+
+	// Timeout for delivering metadata notifications
+	MetadataNotifyTimeout time.Duration
+
+	// Cluster configuration
+	Cluster cluster.Config
+
+	// SIP Authentication configuration
+	SIPAuth *SIPAuthConfig
+
+	// Recording configuration
+	Recording *RecordingConfig
+}
+
+// RecordingConfig holds recording-specific settings for the SIP handler
+type RecordingConfig struct {
+	Format      string // Recording format: wav, mp3, opus, ogg, mp4
+	MP3Bitrate  int    // MP3 bitrate in kbps
+	OpusBitrate int    // Opus bitrate in kbps
+	Quality     int    // Quality setting 1-10
+}
+
+// SIPAuthConfig holds SIP-specific authentication settings
+type SIPAuthConfig struct {
+	// Whether SIP Digest authentication is enabled
+	DigestEnabled bool
+
+	// Authentication realm
+	Realm string
+
+	// Nonce timeout in seconds
+	NonceTimeout int
+
+	// Users map (username -> password)
+	Users map[string]string
+
+	// IP-based access control
+	IPAccessEnabled bool
+	DefaultAllow    bool
+	AllowedIPs      []string
+	AllowedNetworks []string
+	BlockedIPs      []string
+	BlockedNetworks []string
+}
+
+// Handler for SIP requests - now works with CustomSIPServer
+type Handler struct {
+	Logger      *logrus.Logger
+	Config      *Config
+	ActiveCalls *ShardedMap // Sharded map of call UUID to CallData for better concurrency
+
+	// Speech-to-text callback function
+	STTCallback func(context.Context, string, io.Reader, string) error
+
+	// SessionMetadataCallback is called when a recording session is created
+	// It allows session metadata (Oracle UCID, Conversation ID, etc.) to be
+	// propagated to conversation tracking for AMQP publishing
+	SessionMetadataCallback func(callUUID string, metadata map[string]string)
+
+	// ClearSessionMetadataCallback is called when a call ends to clean up
+	// session metadata stored in the transcription service
+	ClearSessionMetadataCallback func(callUUID string)
+
+	// For session redundancy
+	SessionStore SessionStore
+
+	// For session monitor goroutine
+	monitorCtx       context.Context
+	monitorCancel    context.CancelFunc
+	sessionMonitorWG sync.WaitGroup
+
+	// NAT rewriter for SIP header modification
+	NATRewriter *NATRewriter
+
+	// Custom SIP server for handling SIPREC with metadata
+	Server *CustomSIPServer
+
+	// Metadata notifier for SIPREC state changes
+	Notifier *MetadataNotifier
+
+	analyticsDispatcher *analytics.Dispatcher
+	cdrService          *cdr.CDRService
+	sttManager          *stt.ProviderManager
+	clusterManager      *cluster.Manager
+
+	// Cluster orchestrator for distributed features
+	clusterOrchestrator *cluster.ClusterOrchestrator
+
+	// SIP Authentication
+	sipAuthenticator   *auth.SIPAuthenticator
+	ipAccessController *auth.IPAccessController
+
+	// SIP Rate Limiting
+	sipRateLimiter SIPRateLimiter
+
+	// Policy enforcement
+	policyManager *siprec.PolicyManager
+}
+
+// SIPRateLimiter interface for rate limiting SIP requests
+type SIPRateLimiter interface {
+	AllowRequest(clientIP string, method string) bool
+	AllowINVITE(clientIP string) bool
+	BlockClient(clientIP string, duration time.Duration)
+	IsBlocked(clientIP string) bool
+}
+
+// CallData holds information about an active call
+type CallData struct {
+	// Forwarder for RTP packets
+	Forwarder *media.RTPForwarder `json:"-"`
+
+	// SIPREC recording session information
+	RecordingSession *siprec.RecordingSession
+
+	// Dialog information for the call (required for sending BYE)
+	DialogInfo *DialogInfo
+
+	// Last activity timestamp (for session monitoring)
+	LastActivity time.Time
+
+	// Remote address for potential reconnection
+	RemoteAddress string
+
+	// TraceScope links the call to its OpenTelemetry span
+	TraceScope *tracing.CallScope `json:"-"`
+
+	// Mutex for protecting mutable fields
+	mu sync.RWMutex `json:"-"`
+}
+
+// DialogInfo holds information about a SIP dialog
+type DialogInfo struct {
+	// Call-ID for the dialog
+	CallID string
+
+	// Tags for From and To headers
+	LocalTag  string
+	RemoteTag string
+
+	// URI values
+	LocalURI  string
+	RemoteURI string
+
+	// Sequence numbers
+	LocalSeq  int
+	RemoteSeq int
+
+	// Contact header
+	Contact string
+
+	// Route set
+	RouteSet []string
+}
+
+// NewHandler creates a new SIP handler
+func NewHandler(logger *logrus.Logger, config *Config, sttManager *stt.ProviderManager) (*Handler, error) {
+	if config == nil {
+		return nil, errors.New("configuration cannot be nil")
+	}
+
+	// Determine shard count - use default of 32 if not specified
+	shardCount := config.ShardCount
+	if shardCount <= 0 {
+		shardCount = 32
+		logger.WithField("default_shard_count", shardCount).Info("Using default shard count for call map")
+	}
+
+	// Create a new sharded map for active calls
+	activeCalls := NewShardedMap(shardCount)
+
+	// Create the handler
+	handler := &Handler{
+		Logger:      logger,
+		Config:      config,
+		ActiveCalls: activeCalls,
+		sttManager:  sttManager,
+	}
+
+	if sttManager != nil {
+		handler.STTCallback = handler.routeSTTCallThroughManager
+	} else {
+		handler.STTCallback = func(ctx context.Context, vendor string, reader io.Reader, callUUID string) error {
+			return stt.ErrNoProviderAvailable
+		}
+	}
+
+	handler.Notifier = NewMetadataNotifier(logger, config.MetadataCallbackURLs, config.MetadataNotifyTimeout)
+	if len(config.MetadataCallbackURLs) > 0 {
+		logger.WithField("endpoint_count", len(config.MetadataCallbackURLs)).Info("Metadata callbacks configured")
+	}
+
+	// Initialize NAT rewriter if NAT configuration is provided
+	if config.NATConfig != nil {
+		natRewriter, err := NewNATRewriter(config.NATConfig, logger)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to initialize NAT rewriter")
+		}
+		handler.NATRewriter = natRewriter
+		logger.Info("NAT rewriter initialized for SIP header rewriting")
+	} else if config.MediaConfig != nil {
+		// Try to create NAT config from media config with SIP ports
+		natConfig := NewNATConfigFromMediaConfig(config.MediaConfig, config.SIPPorts)
+		if natConfig != nil {
+			natRewriter, err := NewNATRewriter(natConfig, logger)
+			if err != nil {
+				logger.WithError(err).Warn("Failed to initialize NAT rewriter from media config")
+			} else {
+				handler.NATRewriter = natRewriter
+				logger.Info("NAT rewriter initialized from media configuration")
+			}
+		}
+	}
+
+	// Determine if we should enable persistent session tracking
+	enablePersistence := false
+
+	if config.SessionStore != nil {
+		handler.SessionStore = NewSharedSessionStore(config.SessionStore, config.SessionNodeID, logger)
+		logger.WithField("node_id", config.SessionNodeID).Info("Using shared session manager store")
+		enablePersistence = true
+	} else if config.RedundancyEnabled {
+		switch config.RedundancyStorageType {
+		case "memory", "":
+			logger.Info("Using in-memory session store")
+			handler.SessionStore = NewMemorySessionStore()
+		default:
+			logger.Warn("Unknown storage type, using in-memory session store")
+			handler.SessionStore = NewMemorySessionStore()
+		}
+		enablePersistence = true
+	}
+
+	if enablePersistence {
+		// #nosec G118 -- context.Background is appropriate for session monitor context
+		handler.monitorCtx, handler.monitorCancel = context.WithCancel(context.Background())
+		handler.sessionMonitorWG.Add(1)
+		go handler.monitorSessions(handler.monitorCtx)
+	}
+
+	// Initialize policy manager for RFC 7866 policy enforcement
+	handler.policyManager = siprec.NewPolicyManager(siprec.PolicyActionRecord)
+	logger.Info("Policy enforcement manager initialized")
+
+	// Initialize the custom SIP server
+	handler.Server = NewCustomSIPServer(logger, handler)
+
+	// Initialize Cluster Manager if enabled
+	if config.Cluster.Enabled && handler.SessionStore != nil {
+		// Attempt to extract Redis client from the session store
+		// handler.SessionStore is likely a *SharedSessionStore (same package)
+		// which wraps a sessions.SessionStore
+		if sharedStore, ok := handler.SessionStore.(*SharedSessionStore); ok {
+			// sharedStore.store is sessions.SessionStore
+			if redisStore, ok := sharedStore.store.(*sessions.RedisSessionStore); ok {
+				handler.clusterManager = cluster.NewManager(
+					config.Cluster,
+					redisStore.GetClient(),
+					logger,
+					config.SessionNodeID,
+				)
+				if err := handler.clusterManager.Start(); err != nil {
+					logger.WithError(err).Error("Failed to start cluster manager")
+				} else {
+					logger.Info("Cluster manager started")
+
+					// Wire leader checker into metadata notifier for leader-only callbacks
+					if handler.Notifier != nil && config.Cluster.LeaderElectionEnabled {
+						handler.Notifier.SetLeaderChecker(handler.clusterManager.IsLeader, true)
+						logger.Info("Metadata notifier configured for leader-only callbacks")
+					}
+				}
+			}
+		}
+	}
+
+	// Initialize SIP authentication if configured
+	if config.SIPAuth != nil {
+		if config.SIPAuth.DigestEnabled {
+			handler.sipAuthenticator = auth.NewSIPAuthenticator(config.SIPAuth.Realm, logger)
+			// Add configured users
+			for username, password := range config.SIPAuth.Users {
+				handler.sipAuthenticator.AddUser(username, password)
+			}
+			logger.WithFields(logrus.Fields{
+				"realm":      config.SIPAuth.Realm,
+				"user_count": len(config.SIPAuth.Users),
+			}).Info("SIP Digest authentication initialized")
+		}
+
+		if config.SIPAuth.IPAccessEnabled {
+			handler.ipAccessController = auth.NewIPAccessController(logger, config.SIPAuth.DefaultAllow)
+			// Add allowed IPs
+			for _, ip := range config.SIPAuth.AllowedIPs {
+				if ip != "" {
+					handler.ipAccessController.AddAllowedIP(ip)
+				}
+			}
+			// Add allowed networks
+			for _, network := range config.SIPAuth.AllowedNetworks {
+				if network != "" {
+					handler.ipAccessController.AddAllowedNetwork(network)
+				}
+			}
+			// Add blocked IPs
+			for _, ip := range config.SIPAuth.BlockedIPs {
+				if ip != "" {
+					handler.ipAccessController.AddBlockedIP(ip)
+				}
+			}
+			// Add blocked networks
+			for _, network := range config.SIPAuth.BlockedNetworks {
+				if network != "" {
+					handler.ipAccessController.AddBlockedNetwork(network)
+				}
+			}
+			logger.WithFields(logrus.Fields{
+				"default_allow": config.SIPAuth.DefaultAllow,
+			}).Info("SIP IP-based access control initialized")
+		}
+	}
+
+	return handler, nil
+}
+
+// SetupHandlers is a compatibility method - actual handlers are set up by CustomSIPServer
+func (h *Handler) SetupHandlers() {
+	// Handler setup is now done by CustomSIPServer directly
+	// The custom server calls appropriate handler methods based on SIP method
+	h.Logger.Info("SIP request handlers configured via CustomSIPServer")
+}
+
+// SetAnalyticsDispatcher registers the analytics dispatcher used for per-call analytics.
+func (h *Handler) SetAnalyticsDispatcher(dispatcher *analytics.Dispatcher) {
+	h.analyticsDispatcher = dispatcher
+}
+
+// SetCDRService registers the CDR persistence service used for call completion events.
+func (h *Handler) SetCDRService(service *cdr.CDRService) {
+	h.cdrService = service
+}
+
+// CDRService returns the configured CDR service.
+func (h *Handler) CDRService() *cdr.CDRService {
+	return h.cdrService
+}
+
+// AuthenticateRequest checks if a SIP request is authenticated
+// Returns: (authenticated bool, challenge string if auth required)
+func (h *Handler) AuthenticateRequest(authHeader, method, uri, clientIP string) (bool, string) {
+	// Check IP-based access control first
+	if h.ipAccessController != nil {
+		if !h.ipAccessController.IsAllowed(clientIP) {
+			h.Logger.WithField("client_ip", clientIP).Warn("SIP request blocked by IP access control")
+			metrics.RecordIPAccessBlocked("ip_filter")
+			return false, "" // No challenge, just reject
+		}
+		// Record allowed access
+		metrics.RecordIPAccessAllowed("ip_filter")
+	}
+
+	// Check Digest authentication if enabled
+	if h.sipAuthenticator != nil {
+		result := h.sipAuthenticator.Authenticate(authHeader, method, uri, clientIP)
+		if !result.Success {
+			metrics.RecordSIPAuthFailure(result.Reason)
+			return false, result.Challenge
+		}
+		h.Logger.WithFields(logrus.Fields{
+			"username":  result.Username,
+			"client_ip": clientIP,
+			"method":    method,
+		}).Debug("SIP request authenticated")
+	}
+
+	return true, ""
+}
+
+// IsAuthenticationEnabled returns whether any form of SIP authentication is enabled
+func (h *Handler) IsAuthenticationEnabled() bool {
+	return h.sipAuthenticator != nil || h.ipAccessController != nil
+}
+
+// IsIPAccessEnabled returns whether IP-based access control is enabled
+func (h *Handler) IsIPAccessEnabled() bool {
+	return h.ipAccessController != nil
+}
+
+// IsDigestAuthEnabled returns whether SIP Digest authentication is enabled
+func (h *Handler) IsDigestAuthEnabled() bool {
+	return h.sipAuthenticator != nil
+}
+
+// SetSIPRateLimiter sets the SIP rate limiter for the handler
+func (h *Handler) SetSIPRateLimiter(limiter SIPRateLimiter) {
+	h.sipRateLimiter = limiter
+	h.Logger.Info("SIP rate limiter configured")
+}
+
+// SetClusterOrchestrator sets the cluster orchestrator for distributed features
+func (h *Handler) SetClusterOrchestrator(orchestrator *cluster.ClusterOrchestrator) {
+	h.clusterOrchestrator = orchestrator
+	h.Logger.Info("Cluster orchestrator configured for distributed rate limiting and tracing")
+}
+
+// GetClusterOrchestrator returns the cluster orchestrator
+func (h *Handler) GetClusterOrchestrator() *cluster.ClusterOrchestrator {
+	return h.clusterOrchestrator
+}
+
+// IsSIPRateLimitEnabled returns whether SIP rate limiting is enabled
+func (h *Handler) IsSIPRateLimitEnabled() bool {
+	return h.sipRateLimiter != nil
+}
+
+// CheckSIPRateLimit checks if a SIP request should be allowed based on rate limits
+// Returns true if allowed, false if rate limited
+func (h *Handler) CheckSIPRateLimit(clientIP, method string) bool {
+	// Check distributed rate limits first (cluster-wide)
+	if h.clusterOrchestrator != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		if !h.clusterOrchestrator.AllowCall(ctx, clientIP) {
+			h.Logger.WithFields(logrus.Fields{
+				"client_ip":  clientIP,
+				"method":     method,
+				"limit_type": "distributed",
+			}).Warn("SIP request rejected by distributed rate limiter")
+			metrics.RecordSIPRateLimited(method)
+			return false
+		}
+	}
+
+	// Then check local rate limits
+	if h.sipRateLimiter == nil {
+		return true
+	}
+
+	allowed := h.sipRateLimiter.AllowRequest(clientIP, method)
+	if !allowed {
+		h.Logger.WithFields(logrus.Fields{
+			"client_ip":  clientIP,
+			"method":     method,
+			"limit_type": "local",
+		}).Warn("SIP request rate limited")
+		metrics.RecordSIPRateLimited(method)
+	}
+	return allowed
+}
+
+// IsClusterLeader returns true if this node is the cluster leader
+// Returns true if clustering is disabled (single node mode)
+func (h *Handler) IsClusterLeader() bool {
+	if h.clusterManager == nil {
+		return true // Single node mode - always leader
+	}
+	return h.clusterManager.IsLeader()
+}
+
+// GetClusterManager returns the cluster manager, or nil if clustering is disabled
+func (h *Handler) GetClusterManager() *cluster.Manager {
+	return h.clusterManager
+}
+
+// GetPolicyManager returns the policy manager for RFC 7866 policy enforcement
+func (h *Handler) GetPolicyManager() *siprec.PolicyManager {
+	return h.policyManager
+}
+
+// EvaluateRecordingPolicy evaluates whether a session should be recorded based on policy
+func (h *Handler) EvaluateRecordingPolicy(session *siprec.RecordingSession, metadata *siprec.RSMetadata) *siprec.PolicyDecision {
+	if h.policyManager == nil {
+		// No policy manager - default to allowing recording
+		return &siprec.PolicyDecision{
+			Action:     siprec.PolicyActionRecord,
+			AllowAudio: true,
+			AllowVideo: true,
+			AllowText:  true,
+		}
+	}
+	return h.policyManager.EvaluateSession(session, metadata)
+}
+
+// AddPolicyRule adds a recording policy rule
+func (h *Handler) AddPolicyRule(rule *siprec.PolicyRule) error {
+	if h.policyManager == nil {
+		return errors.New("policy manager not initialized")
+	}
+	return h.policyManager.AddRule(rule)
+}
+
+// ProcessPolicyUpdates handles policy updates from SIPREC metadata
+func (h *Handler) ProcessPolicyUpdates(sessionID string, metadata *siprec.RSMetadata) {
+	if h.policyManager == nil || metadata == nil {
+		return
+	}
+
+	for _, update := range metadata.PolicyUpdates {
+		h.policyManager.ProcessPolicyUpdate(sessionID, update)
+		h.Logger.WithFields(logrus.Fields{
+			"session_id": sessionID,
+			"policy_id":  update.PolicyID,
+			"status":     update.Status,
+			"acked":      update.Acknowledged,
+		}).Debug("Processed policy update from metadata")
+	}
+}
+
+// ClearSTTRouting removes call-specific STT routing information.
+func (h *Handler) ClearSTTRouting(callUUID string) {
+	if h.sttManager != nil {
+		h.sttManager.ClearCallRoute(callUUID)
+	}
+}
+
+// routeSTTCallThroughManager resolves the appropriate provider and streams audio.
+func (h *Handler) routeSTTCallThroughManager(ctx context.Context, vendor string, reader io.Reader, callUUID string) error {
+	if h.sttManager == nil {
+		return stt.ErrNoProviderAvailable
+	}
+
+	resolved := h.sttManager.SelectProviderForCall(callUUID, vendor)
+	if !strings.EqualFold(resolved, vendor) {
+		h.Logger.WithFields(logrus.Fields{
+			"call_uuid": callUUID,
+			"requested": vendor,
+			"resolved":  resolved,
+		}).Info("Routing STT stream to provider")
+	}
+
+	return h.sttManager.StreamToProvider(ctx, resolved, reader, callUUID)
+}
+
+// UpdateActivity updates the last activity timestamp for a call
+func (c *CallData) UpdateActivity() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.LastActivity = time.Now()
+}
+
+// IsStale checks if a session is stale based on last activity
+func (c *CallData) IsStale(timeout time.Duration) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return time.Since(c.LastActivity) > timeout
+}
+
+// SafeCopy creates a thread-safe copy of CallData for serialization
+func (c *CallData) SafeCopy() *CallData {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	// Create a copy with only JSON-serializable values
+	// Note: Forwarder contains channels and net.Conn which cannot be marshaled
+	// TraceScope is also not serializable
+	copy := CallData{
+		RecordingSession: c.RecordingSession,
+		DialogInfo:       c.DialogInfo,
+		LastActivity:     c.LastActivity,
+		RemoteAddress:    c.RemoteAddress,
+		// Note: Don't copy Forwarder (contains chan struct{}), TraceScope, or mutex
+	}
+	return &copy
+}
+
+// monitorSessions periodically checks for stale sessions
+func (h *Handler) monitorSessions(ctx context.Context) {
+	defer h.sessionMonitorWG.Done()
+
+	// Add panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			h.Logger.WithFields(logrus.Fields{
+				"panic":     r,
+				"component": "session_monitor",
+			}).Error("Recovered from panic in session monitor")
+		}
+	}()
+
+	logger := h.Logger.WithField("component", "session_monitor")
+	logger.Info("Starting session monitor")
+
+	// Create a ticker for the check interval
+	ticker := time.NewTicker(h.Config.SessionCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("Session monitor shutting down")
+			return
+		case <-ticker.C:
+			// Check for stale sessions
+			h.cleanupStaleSessions()
+		}
+	}
+}
+
+// cleanupStaleSessions checks for and cleans up stale sessions
+func (h *Handler) cleanupStaleSessions() {
+	logger := h.Logger.WithField("component", "session_cleanup")
+
+	// Define stale criterion
+	staleDuration := h.Config.SessionTimeout
+
+	// Collect stale sessions first to avoid modifying map during iteration
+	var staleCallUUIDs []string
+	var staleCallData []*CallData
+
+	h.ActiveCalls.Range(func(key, value interface{}) bool {
+		callUUID := key.(string)
+		callData := value.(*CallData)
+
+		// Check if the session is stale
+		if callData.IsStale(staleDuration) {
+			staleCallUUIDs = append(staleCallUUIDs, callUUID)
+			staleCallData = append(staleCallData, callData)
+		}
+
+		return true // Continue iteration
+	})
+
+	// Process stale sessions outside of the iteration
+	for i, callUUID := range staleCallUUIDs {
+		callData := staleCallData[i]
+		logger.WithField("call_uuid", callUUID).Info("Cleaning up stale session")
+
+		// Stop RTP forwarding and properly clean up resources
+		if callData.Forwarder != nil {
+			// Use mutex to ensure thread-safe access to MarkedForCleanup
+			callData.Forwarder.CleanupMutex.Lock()
+			callData.Forwarder.MarkedForCleanup = true
+			callData.Forwarder.CleanupMutex.Unlock()
+
+			// Safely signal forwarding to stop
+			callData.Forwarder.Stop()
+
+			// Perform thorough cleanup of all RTP forwarder resources
+			callData.Forwarder.Cleanup()
+		}
+
+		if callData.TraceScope != nil {
+			callData.TraceScope.End(nil)
+		}
+
+		// Remove from active calls
+		h.ActiveCalls.Delete(callUUID)
+
+		// Clean up from session store if redundancy is enabled
+		if h.SessionStore != nil {
+			h.SessionStore.Delete(callUUID)
+		}
+	}
+
+	// Clean up stale sessions from the store if redundancy is enabled
+	if h.SessionStore != nil {
+		storedSessions, err := h.SessionStore.List()
+		if err != nil {
+			logger.WithError(err).Error("Failed to list stored sessions")
+			return
+		}
+
+		for _, sessionID := range storedSessions {
+			// Remove orphaned sessions that are too old
+			if _, exists := h.ActiveCalls.Load(sessionID); !exists {
+				sessionData, err := h.SessionStore.Load(sessionID)
+				if err != nil {
+					continue
+				}
+
+				// Check if the session is too old
+				if sessionData.IsStale(h.Config.SessionTimeout * 2) {
+					logger.WithField("session_id", sessionID).Info("Removing stale orphaned session")
+					h.SessionStore.Delete(sessionID)
+				}
+			}
+		}
+	}
+}
+
+// CleanupActiveCalls cleans up all active calls
+func (h *Handler) CleanupActiveCalls() {
+	logger := h.Logger.WithField("component", "cleanup")
+	logger.Info("Cleaning up all active calls")
+
+	// Track if redundancy is enabled
+	isPersistenceEnabled := h.SessionStore != nil
+
+	// Collect all active calls first to avoid modifying map during iteration
+	var activeCallUUIDs []string
+	var activeCallData []*CallData
+
+	h.ActiveCalls.Range(func(key, value interface{}) bool {
+		callUUID := key.(string)
+		callData := value.(*CallData)
+		activeCallUUIDs = append(activeCallUUIDs, callUUID)
+		activeCallData = append(activeCallData, callData)
+		return true // Continue iteration
+	})
+
+	// Process all active calls outside of the iteration
+	for i, callUUID := range activeCallUUIDs {
+		callData := activeCallData[i]
+
+		// Stop RTP forwarding and release resources
+		if callData.Forwarder != nil {
+			logger.WithField("call_uuid", callUUID).Debug("Stopping RTP forwarding")
+			callData.Forwarder.Stop()
+			callData.Forwarder.Cleanup()
+		}
+
+		// Update recording session state if needed
+		if callData.RecordingSession != nil {
+			callData.RecordingSession.RecordingState = "stopped"
+			callData.RecordingSession.EndTime = time.Now()
+
+			// If persistence is enabled, update the session store
+			if isPersistenceEnabled {
+				h.SessionStore.Save(callUUID, callData)
+			}
+		}
+
+		// Remove from the active calls map
+		h.ActiveCalls.Delete(callUUID)
+
+		if callData.TraceScope != nil {
+			callData.TraceScope.End(nil)
+		}
+	}
+
+	// Log status of persistent sessions
+	if isPersistenceEnabled {
+		sessions, err := h.SessionStore.List()
+		if err != nil {
+			logger.WithError(err).Error("Failed to list persistent sessions during shutdown")
+		} else {
+			logger.WithField("preserved_sessions", len(sessions)).
+				Info("Sessions preserved in persistent store for recovery")
+		}
+	}
+}
+
+// GetActiveCallCount returns the number of currently active calls
+func (h *Handler) GetActiveCallCount() int {
+	return h.ActiveCalls.Count()
+}
+
+// GetSession returns information about a specific session
+func (h *Handler) GetSession(id string) (interface{}, error) {
+	// Try to load from active calls
+	if value, exists := h.ActiveCalls.Load(id); exists {
+		callData := value.(*CallData)
+
+		// Read fields protected by callData.mu
+		callData.mu.RLock()
+		lastActivity := callData.LastActivity
+		remoteAddr := callData.RemoteAddress
+		callData.mu.RUnlock()
+
+		// Create session info response
+		sessionInfo := map[string]interface{}{
+			"id":            id,
+			"state":         "active",
+			"last_activity": lastActivity,
+			"remote_addr":   remoteAddr,
+		}
+
+		// Add recording session info if available
+		if callData.RecordingSession != nil {
+			recordingInfo := map[string]interface{}{
+				"session_id":   callData.RecordingSession.ID,
+				"state":        callData.RecordingSession.RecordingState,
+				"start_time":   callData.RecordingSession.StartTime,
+				"participants": len(callData.RecordingSession.Participants),
+				"media_types":  callData.RecordingSession.MediaStreamTypes,
+			}
+
+			// Add vendor-specific metadata if available
+			if callData.RecordingSession.ExtendedMetadata != nil {
+				extMeta := callData.RecordingSession.ExtendedMetadata
+				if v, ok := extMeta["sip_vendor_type"]; ok && v != "" {
+					recordingInfo["vendor_type"] = v
+				}
+				if v, ok := extMeta["sip_oracle_ucid"]; ok && v != "" {
+					recordingInfo["oracle_ucid"] = v
+				}
+				if v, ok := extMeta["sip_oracle_conversation_id"]; ok && v != "" {
+					recordingInfo["oracle_conversation_id"] = v
+				}
+				if v, ok := extMeta["sip_cisco_session_id"]; ok && v != "" {
+					recordingInfo["cisco_session_id"] = v
+				}
+				if v, ok := extMeta["sip_avaya_conversation_id"]; ok && v != "" {
+					recordingInfo["avaya_conversation_id"] = v
+				}
+				if v, ok := extMeta["sip_ucid"]; ok && v != "" {
+					recordingInfo["ucid"] = v
+				}
+				if v, ok := extMeta["sip_uui"]; ok && v != "" {
+					recordingInfo["uui"] = v
+				}
+			}
+
+			sessionInfo["recording"] = recordingInfo
+		}
+
+		// Add dialog info if available
+		if callData.DialogInfo != nil {
+			sessionInfo["dialog"] = map[string]interface{}{
+				"call_id":    callData.DialogInfo.CallID,
+				"local_tag":  callData.DialogInfo.LocalTag,
+				"remote_tag": callData.DialogInfo.RemoteTag,
+				"local_uri":  callData.DialogInfo.LocalURI,
+				"remote_uri": callData.DialogInfo.RemoteURI,
+			}
+		}
+
+		return sessionInfo, nil
+	}
+
+	// Try to load from persistent store if enabled
+	if h.SessionStore != nil {
+		storedData, err := h.SessionStore.Load(id)
+		if err == nil && storedData != nil {
+			// Return stored session info
+			storedInfo := map[string]interface{}{
+				"id":            id,
+				"state":         "stored",
+				"last_activity": storedData.LastActivity,
+				"remote_addr":   storedData.RemoteAddress,
+			}
+
+			// Add recording info with vendor metadata if available
+			if storedData.RecordingSession != nil {
+				recordingInfo := map[string]interface{}{
+					"session_id": storedData.RecordingSession.ID,
+					"state":      storedData.RecordingSession.RecordingState,
+					"start_time": storedData.RecordingSession.StartTime,
+				}
+
+				// Add vendor-specific metadata
+				if storedData.RecordingSession.ExtendedMetadata != nil {
+					extMeta := storedData.RecordingSession.ExtendedMetadata
+					if v, ok := extMeta["sip_vendor_type"]; ok && v != "" {
+						recordingInfo["vendor_type"] = v
+					}
+					if v, ok := extMeta["sip_oracle_ucid"]; ok && v != "" {
+						recordingInfo["oracle_ucid"] = v
+					}
+					if v, ok := extMeta["sip_oracle_conversation_id"]; ok && v != "" {
+						recordingInfo["oracle_conversation_id"] = v
+					}
+					if v, ok := extMeta["sip_cisco_session_id"]; ok && v != "" {
+						recordingInfo["cisco_session_id"] = v
+					}
+					if v, ok := extMeta["sip_avaya_conversation_id"]; ok && v != "" {
+						recordingInfo["avaya_conversation_id"] = v
+					}
+					if v, ok := extMeta["sip_ucid"]; ok && v != "" {
+						recordingInfo["ucid"] = v
+					}
+				}
+
+				storedInfo["recording"] = recordingInfo
+			}
+
+			return storedInfo, nil
+		}
+	}
+
+	return nil, errors.New("session not found")
+}
+
+// GetAllSessions returns information about all active sessions
+func (h *Handler) GetAllSessions() ([]interface{}, error) {
+	sessions := make([]interface{}, 0)
+
+	// Collect active sessions
+	h.ActiveCalls.Range(func(key, value interface{}) bool {
+		id := key.(string)
+		sessionInfo, err := h.GetSession(id)
+		if err == nil {
+			sessions = append(sessions, sessionInfo)
+		}
+		return true
+	})
+
+	// Add stored sessions if redundancy is enabled
+	if h.SessionStore != nil {
+		storedIDs, err := h.SessionStore.List()
+		if err == nil {
+			for _, id := range storedIDs {
+				// Skip if already in active calls
+				if _, exists := h.ActiveCalls.Load(id); exists {
+					continue
+				}
+
+				sessionInfo, err := h.GetSession(id)
+				if err == nil {
+					sessions = append(sessions, sessionInfo)
+				}
+			}
+		}
+	}
+
+	return sessions, nil
+}
+
+// GetSessionStatistics returns detailed session statistics
+func (h *Handler) GetSessionStatistics() map[string]interface{} {
+	activeCalls := h.GetActiveCallCount()
+
+	stats := map[string]interface{}{
+		"active_calls":      activeCalls,
+		"metrics_available": true,
+		"timestamp":         time.Now().Unix(),
+	}
+
+	// Count different session states
+	var recording, connected int
+
+	h.ActiveCalls.Range(func(key, value interface{}) bool {
+		callData := value.(*CallData)
+		if callData.RecordingSession != nil {
+			recording++
+			if callData.RecordingSession.RecordingState == "active" {
+				connected++
+			}
+		}
+		return true
+	})
+
+	stats["recording_sessions"] = recording
+	stats["connected_sessions"] = connected
+
+	// Add memory stats if available
+	if h.SessionStore != nil {
+		if storedIDs, err := h.SessionStore.List(); err == nil {
+			stats["stored_sessions"] = len(storedIDs)
+		}
+	}
+
+	// Add port usage stats
+	available, total := media.GetPortManagerStats()
+	stats["rtp_ports"] = map[string]interface{}{
+		"available": available,
+		"total":     total,
+		"used":      total - available,
+	}
+
+	return stats
+}
+
+// Shutdown gracefully shuts down the SIP handler and all its components
+func (h *Handler) Shutdown(ctx context.Context) error {
+	logger := h.Logger.WithField("operation", "sip_shutdown")
+	logger.Info("Shutting down SIP handler and all components")
+
+	// Log the number of active calls before shutdown
+	callCount := h.GetActiveCallCount()
+	logger.WithField("active_calls", callCount).Info("Active calls before shutdown")
+
+	// First clean up all active calls
+	h.CleanupActiveCalls()
+
+	// Stop the session monitor
+	if h.monitorCancel != nil {
+		h.monitorCancel()
+
+		// Wait for the monitor goroutine to exit with a timeout
+		done := make(chan struct{})
+		go func() {
+			h.sessionMonitorWG.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			logger.Debug("Session monitor stopped gracefully")
+		case <-ctx.Done():
+			logger.Warn("Timed out waiting for session monitor to stop")
+		}
+	}
+
+	// Shutdown NAT rewriter background processes
+	if h.NATRewriter != nil {
+		h.NATRewriter.Shutdown()
+		logger.Debug("NAT rewriter background processes stopped")
+	}
+
+	// SIP server resources are now managed by CustomSIPServer
+	logger.Info("SIP Handler shutdown - server resources managed by CustomSIPServer")
+
+	// Close session store if needed
+	if closer, ok := h.SessionStore.(io.Closer); ok {
+		if err := closer.Close(); err != nil {
+			logger.WithError(err).Warn("Error closing session store")
+		}
+	}
+
+	// Stop cluster manager
+	if h.clusterManager != nil {
+		h.clusterManager.Stop()
+	}
+
+	logger.Info("SIP handler shutdown complete")
+	return nil
+}
+
+// MemorySessionStore is an in-memory implementation of the SessionStore interface
+type MemorySessionStore struct {
+	sessions sync.Map
+}
+
+// NewMemorySessionStore creates a new in-memory session store
+func NewMemorySessionStore() *MemorySessionStore {
+	return &MemorySessionStore{}
+}
+
+// Save stores a call data by key
+func (s *MemorySessionStore) Save(key string, data *CallData) error {
+	// Create a safe copy to avoid race conditions during serialization
+	safeCopy := data.SafeCopy()
+
+	// Serialize the call data to JSON
+	jsonData, err := json.Marshal(safeCopy)
+	if err != nil {
+		return err
+	}
+
+	// Store the serialized data
+	s.sessions.Store(key, jsonData)
+	return nil
+}
+
+// Load retrieves call data by key
+func (s *MemorySessionStore) Load(key string) (*CallData, error) {
+	// Get the serialized data
+	value, ok := s.sessions.Load(key)
+	if !ok {
+		return nil, errors.New("session not found")
+	}
+
+	// Deserialize the data
+	jsonData, ok := value.([]byte)
+	if !ok {
+		return nil, errors.New("invalid session data format")
+	}
+
+	// Unmarshal the data
+	var callData CallData
+	err := json.Unmarshal(jsonData, &callData)
+	if err != nil {
+		return nil, err
+	}
+
+	return &callData, nil
+}
+
+// Delete removes call data by key
+func (s *MemorySessionStore) Delete(key string) error {
+	s.sessions.Delete(key)
+	return nil
+}
+
+// List returns all stored keys
+func (s *MemorySessionStore) List() ([]string, error) {
+	keys := []string{}
+	s.sessions.Range(func(key, _ interface{}) bool {
+		keys = append(keys, key.(string))
+		return true
+	})
+	return keys, nil
+}

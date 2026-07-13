@@ -1,0 +1,152 @@
+# Binaries
+/siprec-server
+/siprec-server-linux*
+/siprec-linux
+/siprec-linux-amd64
+/main
+/env-test
+/test_audio
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/test_tls/test_tls
+/test_tls/mock_invite_tls
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.html
+
+# Build artifacts
+/build/
+/dist/
+/siprec
+siprecctl
+testenv
+
+# Dependency directories
+/vendor/
+.gomodcache/
+
+# Go workspace file
+go.work
+
+# Environment variables
+.env
+.env.*
+.env.bak
+.env.online
+.env.production
+.env.test
+!.env.example
+
+# Recordings and sessions
+/recordings/
+/sessions/
+/test-recordings/
+*.wav
+*.mp3
+*.raw
+
+# Certificates and keys
+/certs/*.pem
+/certs/*.crt
+/certs/*.key
+/keys
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*~
+
+# Logs
+*.log
+*.log.*
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Backup files and PIDs
+*.bak
+*.pid
+server.pid
+
+# Test results and coverage
+test-results/
+coverage/
+
+# SIPp test artifacts and configs
+test/sipp/*.xml
+test/sipp/*.csv
+test/sipp/*.pcap
+test/sipp/*.ulaw
+test/sipp/
+test/test_siprec.sh
+test_certs/
+load_test_stats.csv
+
+# Temporary files
+*.tmp
+*.temp
+
+# Runtime data
+/data/
+/tmp/
+
+# Development planning and roadmap files
+ROADMAP.md
+roadmap.md
+ROADMAP*.md
+roadmap*.md
+TODO.md
+todo.md
+PLANNING.md
+planning.md
+DEVELOPMENT.md
+development.md
+NOTES.md
+notes.md
+*.roadmap
+*.todo
+*.planning
+*.notes
+AGENTS.md
+
+# Internal test results and planning docs
+ENTERPRISE_SCALE_PLAN.md
+LOAD_TEST*.md
+LOGGING_CONFIGURATION.md
+TEST_RESULTS.md
+TESTING_COMPLETE.md
+*_TEST_RESULTS.md
+
+# Test scripts (keep examples in test/)
+test/load_test_results/
+test/*_load_test.sh
+
+# Deployment files with sensitive data
+deploy_enhanced.sh
+manual_deploy.sh
+*deploy*.tar.gz
+deployment_package/
+siprec-deploy.tar.gz
+siprec-enhanced-deployment.tar.gz
+
+# Deployment scripts (keep public ones)
+!deploy_gcp_linux.sh
+!deploy-quick.sh
+
+# Go build cache
+.gocache/
+
+# Example binaries
+examples/deepgram_integration/deepgram_integration
+examples/google_integration/google_integration
+examples/nat_traversal/nat_traversal
+examples/streaming_response/streaming_response

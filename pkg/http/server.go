@@ -1,0 +1,404 @@
+package http
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"sync"
+	"time"
+
+	"siprec-server/pkg/metrics"
+	"siprec-server/pkg/version"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/sirupsen/logrus"
+)
+
+// Use Config from config.go instead of defining it here
+
+// maxJSONBodyBytes caps the size of JSON request bodies accepted by API
+// handlers to prevent memory exhaustion from oversized payloads.
+const maxJSONBodyBytes = 1 << 20 // 1 MiB
+
+// limitJSONBody wraps the request body with http.MaxBytesReader so oversized
+// payloads abort decoding instead of being buffered in memory.
+func limitJSONBody(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
+}
+
+// MetricsProvider is an interface that exposes metrics for the HTTP server
+type MetricsProvider interface {
+	GetActiveCallCount() int
+	GetMetrics() map[string]interface{}
+}
+
+// RateLimitMiddleware interface for rate limiting
+type RateLimitMiddleware interface {
+	Middleware(next http.Handler) http.Handler
+}
+
+// CorrelationMiddleware interface for request correlation
+type CorrelationMiddleware interface {
+	Middleware(next http.Handler) http.Handler
+}
+
+// Server represents the HTTP server for health checks and metrics
+type Server struct {
+	config                *Config
+	logger                *logrus.Logger
+	httpServer            *http.Server
+	mux                   *http.ServeMux
+	metricsProvider       MetricsProvider
+	startTime             time.Time
+	additionalHandlers    map[string]http.HandlerFunc
+	sipHandler            interface{} // Reference to SIP handler
+	wsHub                 *TranscriptionHub
+	amqpClient            interface{} // Reference to AMQP client
+	analyticsWSHandler    *AnalyticsWebSocketHandler
+	authMiddleware        *AuthMiddleware
+	rbacMiddleware        *RBACMiddleware
+	rateLimitMiddleware   RateLimitMiddleware
+	correlationMiddleware CorrelationMiddleware
+	middlewareMu          sync.RWMutex
+}
+
+// NewServer creates a new HTTP server instance
+func NewServer(logger *logrus.Logger, config *Config, metricsProvider MetricsProvider) *Server {
+	if config == nil {
+		config = DefaultConfig()
+	}
+
+	server := &Server{
+		config:             config,
+		logger:             logger,
+		metricsProvider:    metricsProvider,
+		startTime:          time.Now(),
+		additionalHandlers: make(map[string]http.HandlerFunc),
+	}
+
+	mux := http.NewServeMux()
+	server.mux = mux
+	rootHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		server.middlewareMu.RLock()
+		handler := http.Handler(mux)
+		// Apply RBAC middleware (innermost - runs after auth has resolved the principal)
+		if server.rbacMiddleware != nil {
+			handler = server.rbacMiddleware.Middleware(handler)
+		}
+		// Apply auth middleware (inner layer)
+		if server.authMiddleware != nil {
+			handler = server.authMiddleware.Middleware(handler)
+		}
+		// Apply rate limiting middleware
+		if server.rateLimitMiddleware != nil {
+			handler = server.rateLimitMiddleware.Middleware(handler)
+		}
+		// Apply correlation middleware (outermost - adds correlation ID first)
+		if server.correlationMiddleware != nil {
+			handler = server.correlationMiddleware.Middleware(handler)
+		}
+		server.middlewareMu.RUnlock()
+		handler.ServeHTTP(w, r)
+	})
+
+	// Wrap handlers with middleware that adds Server header
+	addServerHeader := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Server", version.ServerHeader())
+			next(w, r)
+		}
+	}
+
+	// Register standard endpoints
+	mux.HandleFunc("/health", addServerHeader(server.HealthHandler))
+	mux.HandleFunc("/health/live", addServerHeader(server.LivenessHandler))
+	mux.HandleFunc("/health/ready", addServerHeader(server.ReadinessHandler))
+
+	// Add metrics endpoints based on configuration
+	if config.EnableMetrics {
+		// Use the comprehensive Prometheus metrics registry if available
+		if registry := metrics.GetRegistry(); registry != nil {
+			// Wrap promhttp handler with Server header middleware
+			promHandler := promhttp.HandlerFor(
+				registry,
+				promhttp.HandlerOpts{
+					EnableOpenMetrics: true,
+					Registry:          registry,
+				},
+			)
+			mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Server", version.ServerHeader())
+				promHandler.ServeHTTP(w, r)
+			})
+			logger.Info("Prometheus metrics endpoint enabled at /metrics")
+		} else {
+			// Fallback to simple metrics
+			mux.HandleFunc("/metrics", addServerHeader(server.metricsHandler))
+			logger.Info("Simple metrics endpoint enabled at /metrics")
+		}
+
+		// Add a simple metrics endpoint as well for basic monitoring
+		mux.HandleFunc("/metrics/simple", addServerHeader(server.metricsHandler))
+	} else {
+		logger.Info("Metrics endpoints disabled")
+	}
+
+	mux.HandleFunc("/status", addServerHeader(server.statusHandler))
+
+	// Create the HTTP server
+	readHeaderTimeout := config.ReadTimeout
+	if readHeaderTimeout <= 0 {
+		// Guard against slowloris-style attacks even when no read timeout is configured
+		readHeaderTimeout = 10 * time.Second
+	}
+	server.httpServer = &http.Server{
+		Addr:              fmt.Sprintf(":%d", config.Port),
+		Handler:           rootHandler,
+		ReadTimeout:       config.ReadTimeout,
+		ReadHeaderTimeout: readHeaderTimeout,
+		WriteTimeout:      config.WriteTimeout,
+		IdleTimeout:       config.IdleTimeout,
+	}
+
+	return server
+}
+
+// SetAuthMiddleware sets the authentication middleware for the server.
+func (s *Server) SetAuthMiddleware(middleware *AuthMiddleware) {
+	s.middlewareMu.Lock()
+	s.authMiddleware = middleware
+	s.middlewareMu.Unlock()
+}
+
+// SetRBACMiddleware sets the RBAC enforcement middleware for the server. It is
+// applied after the authentication middleware so the authenticated principal is
+// available for access checks.
+func (s *Server) SetRBACMiddleware(middleware *RBACMiddleware) {
+	s.middlewareMu.Lock()
+	s.rbacMiddleware = middleware
+	s.middlewareMu.Unlock()
+	s.logger.Info("RBAC enforcement middleware configured")
+}
+
+// SetRateLimitMiddleware sets the rate limiting middleware for the server.
+func (s *Server) SetRateLimitMiddleware(middleware RateLimitMiddleware) {
+	s.middlewareMu.Lock()
+	s.rateLimitMiddleware = middleware
+	s.middlewareMu.Unlock()
+	s.logger.Info("Rate limiting middleware configured")
+}
+
+// SetCorrelationMiddleware sets the correlation ID middleware for request tracking.
+func (s *Server) SetCorrelationMiddleware(middleware CorrelationMiddleware) {
+	s.middlewareMu.Lock()
+	s.correlationMiddleware = middleware
+	s.middlewareMu.Unlock()
+	s.logger.Info("Correlation ID middleware configured")
+}
+
+// RegisterHandler adds a custom handler to the server
+func (s *Server) RegisterHandler(path string, handler http.HandlerFunc) {
+	s.additionalHandlers[path] = handler
+
+	// Add to mux
+	if s.mux != nil {
+		s.mux.HandleFunc(path, handler)
+	}
+
+	s.logger.WithField("path", path).Info("Registered custom HTTP handler")
+}
+
+// SetSIPHandler sets the SIP handler reference for health checks
+func (s *Server) SetSIPHandler(handler interface{}) {
+	s.sipHandler = handler
+}
+
+// SetWebSocketHub sets the WebSocket hub reference for health checks
+func (s *Server) SetWebSocketHub(hub *TranscriptionHub) {
+	s.wsHub = hub
+}
+
+// SetAnalyticsWebSocketHandler sets the analytics WebSocket handler
+func (s *Server) SetAnalyticsWebSocketHandler(handler *AnalyticsWebSocketHandler) {
+	s.analyticsWSHandler = handler
+
+	// Register the WebSocket endpoint
+	if s.mux != nil {
+		s.mux.HandleFunc("/ws/analytics", handler.ServeHTTP)
+		s.logger.Info("Analytics WebSocket endpoint registered at /ws/analytics")
+	}
+}
+
+// Start starts the HTTP server in a goroutine
+func (s *Server) Start() {
+	s.logger.WithField("port", s.config.Port).Info("Starting HTTP server")
+
+	// Start serving in a goroutine
+	go func() {
+		s.logger.Infof("HTTP server listening on port %d", s.config.Port)
+		if s.config.TLSEnabled {
+			if s.config.TLSCertFile == "" || s.config.TLSKeyFile == "" {
+				s.logger.Error("TLS is enabled but certificate or key path is missing; refusing to start HTTP server")
+				return
+			}
+
+			// Validate TLS certificate before starting server
+			if err := s.validateTLSCertificate(s.config.TLSCertFile, s.config.TLSKeyFile); err != nil {
+				s.logger.WithError(err).Error("TLS certificate validation failed; refusing to start HTTP server")
+				return
+			}
+
+			// Enforce modern TLS settings
+			s.httpServer.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+
+			if err := s.httpServer.ListenAndServeTLS(s.config.TLSCertFile, s.config.TLSKeyFile); err != nil && err != http.ErrServerClosed {
+				s.logger.WithError(err).Error("HTTP TLS server failed")
+			}
+			return
+		}
+
+		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			s.logger.WithError(err).Error("HTTP server failed")
+		}
+	}()
+
+	// Verify that we can actually bind to the port
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		s.logger.Info("Verifying HTTP server is running...")
+
+		// Try to open a connection to the server port
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", s.config.Port), 2*time.Second)
+		if err != nil {
+			s.logger.WithError(err).Error("Could not connect to HTTP server")
+		} else {
+			s.logger.Info("HTTP server is running correctly")
+			conn.Close()
+		}
+	}()
+}
+
+// Shutdown gracefully shuts down the HTTP server
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.logger.Info("Shutting down HTTP server...")
+	return s.httpServer.Shutdown(ctx)
+}
+
+// validateTLSCertificate validates that the TLS certificate and key are valid
+func (s *Server) validateTLSCertificate(certFile, keyFile string) error {
+	// Load the certificate and key
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return fmt.Errorf("failed to load certificate/key: %w", err)
+	}
+
+	// Parse the certificate to get expiration info
+	x509Cert, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return fmt.Errorf("failed to parse certificate: %w", err)
+	}
+
+	// Check if certificate is expired
+	now := time.Now()
+	if now.Before(x509Cert.NotBefore) {
+		return fmt.Errorf("certificate is not yet valid (valid from %v)", x509Cert.NotBefore)
+	}
+	if now.After(x509Cert.NotAfter) {
+		return fmt.Errorf("certificate has expired (expired on %v)", x509Cert.NotAfter)
+	}
+
+	// Warn if certificate expires soon (within 30 days)
+	daysUntilExpiry := x509Cert.NotAfter.Sub(now).Hours() / 24
+	if daysUntilExpiry < 30 {
+		s.logger.WithFields(logrus.Fields{
+			"expires_on":        x509Cert.NotAfter,
+			"days_until_expiry": int(daysUntilExpiry),
+		}).Warn("TLS certificate expires soon")
+	}
+
+	s.logger.WithFields(logrus.Fields{
+		"subject":    x509Cert.Subject.CommonName,
+		"issuer":     x509Cert.Issuer.CommonName,
+		"not_before": x509Cert.NotBefore,
+		"not_after":  x509Cert.NotAfter,
+	}).Info("TLS certificate validated successfully")
+
+	return nil
+}
+
+// Removed simple healthHandler - using comprehensive HealthHandler from health.go instead
+
+// metricsHandler handles the /metrics endpoint using Prometheus registry
+func (s *Server) metricsHandler(w http.ResponseWriter, r *http.Request) {
+	s.logger.WithField("endpoint", "/metrics").Debug("Metrics endpoint accessed")
+
+	// Enhanced metrics with proper Prometheus format and additional information
+	activeCalls := 0
+	if s.metricsProvider != nil {
+		activeCalls = s.metricsProvider.GetActiveCallCount()
+	}
+
+	metrics := fmt.Sprintf(`# HELP siprec_active_calls Number of active calls
+# TYPE siprec_active_calls gauge
+siprec_active_calls %d
+
+# HELP siprec_uptime_seconds Uptime of the service in seconds
+# TYPE siprec_uptime_seconds counter
+siprec_uptime_seconds %.2f
+
+# HELP siprec_http_requests_total Total number of HTTP requests
+# TYPE siprec_http_requests_total counter
+siprec_http_requests_total{endpoint="/metrics",method="GET"} 1
+
+# HELP siprec_build_info Build information
+# TYPE siprec_build_info gauge
+siprec_build_info{version="%s",component="siprec-server",go_version="go1.23"} 1
+
+# HELP siprec_health_status Health status of components (1 = healthy, 0 = unhealthy)
+# TYPE siprec_health_status gauge
+siprec_health_status{component="server"} 1
+`,
+		activeCalls,
+		time.Since(s.startTime).Seconds(),
+		version.Version,
+	)
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(metrics))
+}
+
+// statusHandler handles the /status endpoint
+func (s *Server) statusHandler(w http.ResponseWriter, r *http.Request) {
+	s.logger.WithField("endpoint", "/status").Debug("Status endpoint accessed")
+
+	status := map[string]interface{}{
+		"status":       "ok",
+		"uptime":       time.Since(s.startTime).String(),
+		"active_calls": 0,
+		"version":      version.Version,
+		"started_at":   s.startTime.Format(time.RFC3339),
+	}
+
+	// Add metrics if available
+	if s.metricsProvider != nil {
+		status["active_calls"] = s.metricsProvider.GetActiveCallCount()
+
+		// Add other metrics if available
+		if metrics := s.metricsProvider.GetMetrics(); metrics != nil {
+			for k, v := range metrics {
+				status[k] = v
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(status); err != nil {
+		s.logger.WithError(err).Debug("Failed to write status response")
+	}
+}

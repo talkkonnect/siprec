@@ -1,0 +1,675 @@
+# Changelog
+
+All notable changes to IZI SIPREC will be documented in this file.
+
+## [1.3.0] - 2026-07-02
+
+### Added
+- **Azure SAS-Token Authentication**: Azure Blob recording storage can now authenticate with a
+  container-scoped SAS token via `RECORDING_STORAGE_AZURE_SAS_TOKEN`. This is the recommended,
+  least-privilege method — a SAS token can be limited to a single container with create/write
+  permissions and an expiry, unlike an account key which grants full access to the entire
+  storage account. See `docs/configuration.md` → "Azure Blob Storage Authentication".
+- **Azure Auth Validation**: Startup validation ensures exactly one Azure auth method is
+  configured when Azure storage is enabled, and logs a warning when the account key is used.
+
+### Changed
+- **Azure SDK Migration**: Replaced the deprecated `github.com/Azure/azure-storage-blob-go`
+  (v0.15.0, end-of-life) with the modern `github.com/Azure/azure-sdk-for-go/sdk/storage/azblob`.
+  Blob operations now use the client-based API. Existing deployments using
+  `RECORDING_STORAGE_AZURE_ACCESS_KEY` continue to work unchanged.
+
+### Removed
+- Dependencies `github.com/Azure/azure-storage-blob-go` and `github.com/Azure/azure-pipeline-go`.
+
+## [1.2.4] - 2026-06-12
+
+### Security
+- **Removed Committed Encryption Key**: Deleted an encryption key file that had been committed to the repository
+- **Hardened .gitignore**: Keys, certificates, local environment files, and build artifacts are now excluded from version control
+
+### Added
+- **Async STT Job API**: Queued transcription jobs exposed via `/api/stt/submit`, `/api/stt/jobs`, `/api/stt/jobs/{id}`, `/api/stt/stats`, `/api/stt/metrics`, and `/api/stt/queue/purge`
+- **Configuration API**: Hot-reload management endpoints at `/api/config`, `/api/config/validate`, `/api/config/reload`, and `/api/config/reload/status`
+- **RBAC Enforcement**: Optional role-based access control for HTTP API endpoints, enabled via `AUTH_RBAC_ENABLED=true` (requires authentication and database persistence)
+- **SMTP Email Alerting**: The alerting email channel now delivers real SMTP mail with `auto`, `implicit` (SMTPS), `starttls`, and `none` TLS modes
+- **Alert Delivery Metrics**: Notification channels report real delivery success/failure metrics
+- **Encryption Key Backup/Restore**: Encryption keys can be exported to and restored from password-protected backups
+- **AWS Secrets Manager Lookup**: Provider credentials can be resolved from AWS Secrets Manager
+- **DNS & Load Balancer Failover**: Route 53 and GCP DNS failover plus GCP load balancer failover support in the backup/disaster-recovery subsystem
+- **Database Restore**: Disaster-recovery database restore now uses `pg_restore` for PostgreSQL dump archives
+
+### Fixed
+- **STUN Client RFC 5389 Compliance**: External IP discovery now builds and parses STUN messages per RFC 5389
+- **Hot-Reload Deep Copy**: Configuration hot-reload performs a proper deep copy of the active configuration, preventing shared-state mutation between reloads
+
+### Removed
+- Roughly 850 dead/unused functions across the codebase
+- Stale test reports, planning notes, ad-hoc test scripts, and scenario files from the repository root
+
+## [1.2.0] - 2026-03-17
+
+### Added
+- **Per-Stream G.729 Decoder**: Each RTP stream now has its own dedicated G.729 decoder instance
+  - Eliminates cross-call state leakage and race conditions from shared decoder pool
+  - Decoder state is properly isolated per goroutine for thread safety
+  - Added `ConcealPackets()` method for proper PLC that advances decoder state
+
+- **SSRC Validation & Locking**: First RTP packet locks the expected SSRC for the stream
+  - Packets with mismatched SSRC are dropped to prevent stale traffic from port reuse
+  - Protects against cross-talk from delayed packets on recycled ports
+  - Per-stream mismatch counters logged at stream end for diagnostics
+
+- **SSRC Correction Mechanism**: Automatic SSRC switching when the locked SSRC goes silent
+  - Handles "first-packet poisoning" after restart when stale packet locks wrong SSRC
+  - Handles "silent SSRC change" when SBC changes SSRC during hold/unhold without signaling
+  - Safety guards: requires 50+ packets from alternate SSRC AND 30+ consecutive non-locked packets
+  - Blocked during hold state or RTP suspended state to prevent accepting stale traffic
+
+- **Port Allocation Cooldown**: Recently freed ports are avoided to prevent stale RTP crosstalk
+  - Fresh (never-used) ports preferred over recently released ports
+  - Cooldown ports used as fallback only when all fresh ports are exhausted
+  - Prevents new calls from receiving delayed packets from previous calls
+
+- **SIPREC Forwarder Resilience**: SIPREC forwarders now survive RTP timeout instead of terminating
+  - Enter `RTPSuspended` state when RTP times out (SBC stopped RTP without signaling)
+  - Wait for BYE signal from SIP layer for proper cleanup
+  - SSRC correction blocked during suspended state to prevent accepting stale traffic
+
+- **ResetRemoteSSRC API**: SIP signaling events (re-INVITE, UPDATE) reset SSRC lock
+  - Called on re-INVITE with SDP to allow new SSRC from SBC
+  - Called on hold/resume transitions to handle media renegotiation
+  - Clears RTPSuspended state so forwarder is fully active for new stream
+
+### Fixed
+- **gosec Security Alerts**: Fixed all remaining security scanner warnings
+  - G104: Added explicit error ignoring with `#nosec` comments for cleanup operations
+  - G602: Refactored slice access patterns to avoid index bounds warnings
+
+### Technical
+- Per-goroutine `G729StreamDecoder` scoped to RTP forwarding lifetime
+- Atomic `RTPSuspended` flag for lock-free state checking in hot path
+- Port manager tracks recently freed ports with timestamp for cooldown logic
+- All changes validated with race detection and memory leak testing
+- 50 iterations × 100 packets memory test shows 0 goroutine leaks, 0 MB memory growth
+
+## [1.1.1] - 2026-03-17
+
+### Fixed
+- **G.729 DTX Audio Desync**: Fixed channel audio desync and garbled recordings with G.729 codec
+  - DTX (Discontinuous Transmission) silence periods no longer trigger excessive PLC silence insertion
+  - Uses RTP timestamp gaps to distinguish real packet loss from DTX silence suppression
+  - Reduced maxPLC from 100 packets (2s) to 10 packets (200ms) to prevent recording inflation
+  - Fixed sequence tracking for reordered packets to prevent backwards tracking
+
+- **G.729 Decoder Stability**: Added oscillation detection for unstable synthesis filter
+  - Detects 2kHz square wave artifacts (>50% railed samples with >25% sign changes)
+  - Replaces corrupt decoder output with silence to prevent harsh buzzing/distortion
+
+- **WAV Recording Reliability**: Improved recording file handling
+  - WAV files are now finalized on RTP goroutine exit ensuring playable recordings
+  - WAV reader handles unfinalized files by inferring data size from remaining file length
+
+### Added
+- **Buffered STT Pipe**: Replaced unbuffered io.Pipe with buffered pipe (4KB) for STT streaming
+  - Decouples RTP handler from STT backpressure to prevent audio processing stalls
+  - Non-blocking writes prevent RTP packet loss during temporary STT slowdowns
+  - Automatic buffer overflow handling drops oldest data to maintain real-time processing
+
+- **Jitter Buffer**: Added per-leg jitter buffer for RTP packet reordering
+  - Reorders out-of-order packets by sequence number before decoding
+  - Configurable buffer size (default: 5 packets) and max delay (default: 60ms)
+  - Duplicate packet detection and filtering
+  - PLC callback for lost packet notification
+
+- **WAV Start-Time Alignment**: Added wall-clock alignment for multi-leg WAV combining
+  - Records first RTP packet timestamp for each recording leg
+  - `CombineWAVRecordingsAligned()` pads earlier-starting legs with silence
+  - Ensures both channels are wall-clock synchronized in stereo output
+
+### Technical
+- Track `lastDecodedPCMSize` for accurate PLC silence length calculation
+- DTX detection uses 60ms RTP timestamp threshold (3x normal 20ms packet interval)
+- All changes validated with race detection enabled
+- New test coverage for JitterBuffer and BufferedPipe components
+
+## [1.1.0] - 2026-03-15
+
+### Added
+- **Lawful Intercept Package** (`pkg/lawfulintercept/`): Complete implementation for lawful intercept requirements
+  - `Manager`: Intercept lifecycle management with warrant verification and content delivery
+  - `DeliveryClient`: Secure LEA delivery with mutual TLS, batching, retries, and exponential backoff
+  - `AuditLogger`: Tamper-evident audit logging with buffered writes and log rotation
+  - `WarrantVerifier`: External warrant verification with response caching
+  - `ContentEncryptor`: Hybrid RSA-OAEP + AES-256-GCM encryption for intercepted content
+  - Comprehensive audit event types: system start/stop, intercept started/revoked/expired, content delivered, warrant verified/failed
+
+- **Resource Management Package** (`pkg/resources/`): Enterprise resource control and limits enforcement
+  - `Manager`: Central resource manager coordinating all resource limits
+  - `WorkerPool`: Bounded goroutine pool with panic recovery and configurable sizing
+  - `MemoryMonitor`: Memory limit enforcement with automatic GC triggers and detailed stats
+  - `RTPLimiter`: Concurrent RTP stream limiting with atomic operations and wait-for-slot support
+  - Resource exhaustion callbacks for alerting and load balancing integration
+
+### Performance
+- **Lock-free RTP timestamp tracking**: Replaced mutex-protected timestamp with atomic int64 operations
+- **Optimized ShardedMap hashing**: Inline FNV-1a hash eliminates allocations in hot path
+- **Read-write lock optimization**: Changed ProcessingManager to use RWMutex for read-heavy workloads
+- **Memory leak fix**: Fixed slice memory leak in STT result buffer management
+
+### Changed
+- **Go 1.25 Requirement**: Updated minimum Go version from 1.24 to 1.25
+- **Security Hardening**: Fixed all gosec security scan alerts (30 issues resolved)
+  - Fixed slice bounds issues (G602) in STUN handling
+  - Fixed path traversal concerns (G703) with filepath.Clean()
+  - Fixed directory permissions (G301) from 0755 to 0750
+  - Fixed file permissions (G306) from 0644 to 0600
+  - Documented context.Background() usage (G118) for long-running services
+
+### Technical
+- Full test coverage with race detection for all new packages
+- Atomic operations throughout for thread-safe concurrent access
+- Integration with existing config system via ResourceConfig, LawfulInterceptConfig
+- Fixed potential goroutine leak in AnalyticsWebSocketHandler with proper Stop() method
+- Fixed unbounded goroutine spawning in ResourceManager cleanup with semaphore limiting
+- Added buffered channel to TranscriptionHub broadcast to prevent sender blocking
+
+## [1.0.2] - 2026-02-26
+
+### Added
+- **G.729 Codec Support**: Native G.729 (CS-ACELP) decoding using bcg729 library
+  - ITU-T G.729 compliant decoder via `github.com/pidato/audio/g729` bindings
+  - Stateful decoder pool for maintaining decoder state across RTP packets
+  - Support for G.729A (Annex A) which is decoder-compatible
+  - Support for G.729B SID frames (comfort noise)
+
+### Fixed
+- **G.729 Audio Quality**: Resolved noisy/distorted audio in G.729 recordings
+  - Replaced custom decoder with ITU-T compliant bcg729 implementation
+  - Added per-SSRC stateful decoding for proper audio reconstruction
+  - Fixed audio clipping issues with proper gain scaling
+
+- **Race Condition in RTPForwarder**: Fixed concurrent access to codec fields
+  - Added `codecMutex` to protect codec configuration
+  - Added thread-safe `GetCodecInfo()` method
+  - Updated RTP processing to use synchronized access
+
+### Documentation
+- Added G.729/bcg729 build requirements to README
+- Added installation instructions for Ubuntu/Debian, macOS, and RHEL/CentOS
+
+### Requirements
+- **bcg729 library required** for G.729 support
+  - Ubuntu/Debian: `apt-get install libbcg729-dev`
+  - macOS: `brew install bcg729`
+  - Build from source: https://gitlab.linphone.org/BC/public/bcg729.git
+
+## [1.0.1] - 2026-02-17
+
+### Added
+- **Oracle SBC SIPREC XML Extension Support**: Complete parsing of Oracle/ACME Packet proprietary XML extensions
+  - Extract UCID (Universal Call ID) from `<apkt:ucid>` element in SIPREC metadata body
+  - Extract caller origination flag from `<apkt:callerOrig>` element
+  - Extract calling party identification from `<apkt:callingParty>` participant extensions
+  - Support for Oracle's ACME Packet XML namespace (`http://acmepacket.com/siprec/extensiondata`)
+  - New `OracleExtensionData` struct for structured access to Oracle-specific metadata
+  - New helper functions: `ExtractOracleExtensions()`, `GetOracleSessionExtensions()`, `GetOracleParticipantExtensions()`, `IdentifyCallingParticipant()`
+  - UCID extraction priority: XML body extensions take precedence over SIP headers
+
+- **SIPREC Stream Labels**: Added stream label information to AMQP transcription messages
+  - Stream labels now included in transcription metadata for caller/agent identification
+  - Enhanced `ResolveStreamParticipant()` with multiple fallback strategies
+
+### Fixed
+- **Race Condition Fixes**: Comprehensive thread-safety improvements across the codebase
+  - Fixed provider map race condition in `pkg/stt/provider.go` with dedicated mutex
+  - Fixed session metadata race in `pkg/stt/transcription.go` by returning/storing copies instead of references
+  - Fixed global state race in `cmd/siprec/main.go` with initialization flag and snapshot pattern in signal handler
+  - All fixes validated with `go test -race`
+
+### Enhanced
+- **Vendor Documentation**: Updated `docs/vendor-integration.md` with comprehensive Oracle SBC XML extension documentation
+  - Added XML Extension Data table documenting `apkt:ucid`, `apkt:callerOrig`, `apkt:callingParty`
+  - Added example Oracle SIPREC XML metadata
+  - Added UCID Extraction Priority section explaining data source precedence
+
+### Technical
+- Added comprehensive unit tests for Oracle extension extraction in `pkg/siprec/types_test.go`
+- Tests cover: UCID extraction, calling party identification, session/participant extensions, priority ordering
+
+## [1.0.0] - 2026-01-30
+
+### Major Release - IZI SIPREC
+
+This is the first stable release of IZI SIPREC, marking production readiness after extensive testing and validation.
+
+### Added
+- **Full OPUS and G.722 Codec Support**: Complete implementation of OPUS (RFC 6716) and G.722 (ITU-T G.722) decoders for recording calls using these codecs
+  - OPUS decoder supporting SILK, CELT, and Hybrid modes
+  - G.722 Sub-band ADPCM decoder with QMF synthesis filter
+  - Fixes issue where calls using OPUS codec failed to record
+
+- **Multi-Vendor Compatibility**: Validated with all major SBC vendors
+  - Cisco CUBE
+  - Avaya Session Manager
+  - Oracle SBC
+  - Genesys Cloud
+
+- **Production Load Testing**: Validated at scale
+  - 500 concurrent multi-vendor calls with 100% success rate
+  - Zero errors across Cisco, Avaya, Oracle, and Genesys scenarios
+
+- **Load Testing Validation**: Comprehensive load testing with documented results
+  - Validated up to 20,000 concurrent calls with 100% success rate
+  - 6,000 concurrent 5-minute calls over TCP with zero failures
+  - Memory efficiency: ~55 KB per concurrent call (signaling only)
+  - CPU efficiency: Linear scaling at ~0.001% per concurrent call
+  - New SIPp test scenarios in `test/sipp/` directory
+
+- **Multi-Format Audio Recording**: Support for multiple audio output formats via FFmpeg encoding
+  - Supported formats: WAV, MP3, Opus, OGG, MP4/M4A (AAC), FLAC
+  - Configurable bitrate for lossy formats (MP3, Opus, AAC)
+  - Quality settings for VBR encoding
+  - Automatic fallback to WAV if FFmpeg is unavailable
+  - Batch encoding support for converting existing recordings
+  - New environment variables: `RECORDING_FORMAT`, `RECORDING_MP3_BITRATE`, `RECORDING_OPUS_BITRATE`, `RECORDING_QUALITY`
+
+- **Per-Call Timeout Configuration**: Override global timeouts on a per-recording basis
+  - SIP header support: `X-Recording-Timeout`, `X-Recording-Max-Duration`, `X-Recording-Retention`
+  - SIPREC metadata support: `siprecTimeout`, `siprecMaxDuration`, `siprecRetention` elements
+  - Priority order: SIP headers > SIPREC metadata > global configuration
+  - Timeout source tracking for debugging and audit
+
+- **Enhanced Audit Trail with SIP Headers**: Complete SIP header capture for compliance
+  - All SIP-related audit events now include full header information
+  - Core headers: Method, Request-URI, From, To, Call-ID, CSeq, Via, Contact
+  - Authentication headers: Authorization, Proxy-Authorization (auto-redacted)
+  - Routing headers: Route, Record-Route
+  - Session headers: Allow, Supported, Require, User-Agent, Server
+  - Transport info: Protocol, remote/local addresses
+  - Custom/vendor headers captured in dedicated map
+
+- **Leg-Merge Regression Tests**: `pkg/sip/custom_server_test.go` now exercises the WAV combiner to ensure multi-leg SIPREC recordings produce the expected multi-channel output and metadata path.
+
+### Documentation
+- **Recording Format Reference**: README now explains how SIPREC preserves multi-channel WAV layouts from the SDP offer and how to keep both legs in a single stereo file.
+- **Configuration Guide**: Added `RECORDING_COMBINE_LEGS` so operators can explicitly control whether the SRC legs are merged into a single multi-channel WAV.
+- **Audio Format Configuration**: New section documenting supported formats, codec options, and FFmpeg requirements.
+- **Per-Call Timeout Configuration**: New section documenting SIP headers and SIPREC metadata for per-call overrides.
+- **Audit Trail & SIP Headers**: New section documenting captured headers, log format, and filtering examples.
+
+### Fixed
+- **Recording Reliability**: Audio capture is now decoupled from the STT pipeline. Transcription crashes or disabled providers no longer produce zero-byte recordings or keep analytics publishers running past BYE. The server logs when an STT stream shuts down and completes recording/cleanup normally.
+
+## [0.0.34] - 2025-11-09
+
+### Added
+- **Whisper STT Provider**: On-premise speech-to-text using OpenAI's open-source Whisper CLI
+  - Full integration with existing STT provider architecture
+  - Support for 5 model sizes (tiny, base, small, medium, large)
+  - Circuit breaker protection for resilience
+  - Multiple output format support (JSON, TXT, VTT, SRT, TSV, verbose_json)
+  - Injectable runner pattern for comprehensive testability
+  - 23 comprehensive tests covering initialization, formats, errors, edge cases, and advanced scenarios
+- **Whisper Performance & Monitoring**: Production-grade observability and resource management
+  - 4 Prometheus metrics: CLI execution duration histogram, temp file disk usage gauge, timeout counter, output format counter
+  - Aggregate disk usage tracking with increment/decrement pattern for concurrent operations
+  - Concurrent call rate limiting with semaphore-based control
+  - Auto mode limits to CPU core count; manual override for GPU servers
+  - Binary validation with version detection (gracefully handles remote servers)
+- **Remote Deployment Support**: Flexible architecture for distributed Whisper installations
+  - SSH wrapper support for remote GPU servers
+  - HTTP API integration for dedicated Whisper farms
+  - RabbitMQ/queue-based dispatcher support for large-scale deployments
+  - Configurable timeout handling for network latency
+- **Comprehensive Documentation**: Complete setup and reference guides
+  - Dedicated step-by-step setup guide (docs/whisper-setup.md)
+  - 5 deployment scenarios: local CPU/GPU, Docker, SSH wrapper, HTTP API, dedicated farm
+  - Technical reference with configuration, metrics, GPU acceleration, troubleshooting
+  - Model selection guide with performance characteristics
+  - Best practices for production hardening and operations
+- **Comprehensive Test Coverage for GDPR Deletion**: 55+ tests across 5 test files
+  - Backup storage scheme-aware deletion tests (13 tests)
+  - Recording storage manifest tracking tests (15 tests)
+  - GDPR service deletion tests (7 unit tests + 7 integration tests)
+  - Encrypted recording writer tests (8 tests)
+  - Complete end-to-end GDPR erase flow integration tests
+- **CallDataRepository Interface**: Abstraction for GDPR service database operations
+  - Enables proper mocking and testing without database dependencies
+  - Defines contract for GetSessionByCallID, GetCDRByCallID, DeleteCallData, etc.
+  - Improves testability and maintainability of GDPR compliance features
+
+### Enhanced
+- **Storage Deletion Routing**: Improved scheme-aware deletion logic
+  - Better handling of ambiguous schemes (e.g., "gcs" vs "gs")
+  - Exact match support for location identifiers
+  - URL format matching with "scheme://" prefix
+  - Prefix matching with non-letter boundary detection
+- **Test Infrastructure**: Mock implementations for all storage and repository interfaces
+  - Realistic simulation of manifest file operations
+  - Proper cleanup verification in integration tests
+  - Edge case coverage (empty paths, missing files, malformed JSON)
+
+### Fixed
+- Storage matching logic now correctly distinguishes between similar scheme prefixes
+- GDPR service tests properly mock repository interface methods
+- Recording storage mock now simulates manifest deletion behavior
+
+### Technical
+- All tests passing with comprehensive coverage of edge cases
+- Integration tests verify complete upload → track → erase → verify flow
+- Concurrent operation tests ensure thread safety
+- SIPP tests confirm no regression in core functionality
+
+## [0.0.33] - 2025-11-09
+
+### Added
+- **Centralized Version Management**: New `pkg/version` package for consistent version reporting
+  - Single source of truth for application version (0.0.33)
+  - `UserAgent()` function for HTTP client headers
+  - `ServerHeader()` function for SIP and HTTP server headers
+- **SIP Server Header**: All SIP responses now include `Server: siprec/0.0.33` header
+  - Automatically added to 100 Trying, 180 Ringing, 200 OK, and all other responses
+  - Helps with debugging and protocol compliance tracking
+- **HTTP Server Header**: All HTTP responses now include `Server: siprec/0.0.33` header
+  - Applied via middleware to health, metrics, and status endpoints
+  - Consistent server identification across all HTTP responses
+- **User-Agent Header**: HTTP clients now send `User-Agent: siprec/0.0.33`
+  - Applied to STUN fallback HTTP requests for external IP detection
+  - Improves server identification in external API calls
+
+### Fixed
+- **SIPREC Validation**: Treat missing state attribute as warning instead of fatal error
+  - While RFC 7866 §4.2 requires the state attribute, many real-world implementations omit it
+  - Messages without state attribute are now accepted with a warning logged
+  - State defaults to "active" in responses for better interoperability
+  - Added comprehensive test coverage for edge cases:
+    - Missing state without reason
+    - Missing state with valid reason
+    - Missing state with invalid reason
+    - Empty state skipping state-specific validations
+
+### Enhanced
+- **Metrics Endpoint**: Build info now reports actual version (0.0.33) instead of hardcoded "1.0.0"
+- **Status Endpoint**: Version field now dynamically reports current version from version package
+
+## [0.2.3] - 2025-10-19
+
+### Added
+- **Complete MySQL/MariaDB Database Support**: Optional persistence layer with build tags
+  - 30+ CRUD operations for sessions, participants, streams, transcriptions, CDRs
+  - Full-text search across all entities
+  - User management and API key authentication
+  - GDPR-compliant data deletion operations
+- **Multi-Cloud Storage Support**: Automatic recording archival
+  - AWS S3 with lifecycle policies
+  - Google Cloud Storage integration
+  - Azure Blob Storage support
+- **Real-time Analytics Platform**: Elasticsearch-powered analytics
+  - Sentiment analysis and keyword extraction
+  - Compliance monitoring and alerting
+  - WebSocket streaming for live updates
+  - Audio quality metrics (MOS scoring)
+- **Extended STT Provider Support**: 7 providers with intelligent routing
+  - ElevenLabs and Speechmatics integration
+  - Language-based provider routing
+  - Automatic failover with health monitoring
+- **Enterprise Features**:
+  - PCI DSS compliance mode with automatic security hardening
+  - OpenTelemetry integration for distributed tracing
+  - Multi-channel alerting (email, Slack, webhook)
+  - Clustering support with leader election
+  - Automated backup and recovery
+  - Performance monitoring and auto-tuning
+- **Advanced Audio Processing**:
+  - Spectral noise suppression
+  - Automatic Gain Control (AGC)
+  - Echo cancellation with double-talk detection
+  - Audio fingerprinting for duplicate detection
+- **Comprehensive Testing Suite**:
+  - Unit, integration, and E2E tests
+  - Coverage reporting with HTML output
+  - MySQL-specific test targets
+
+### Enhanced
+- Documentation completely updated with all features
+- Build system with optional MySQL support via build tags
+- Circuit breaker patterns for all external services
+- WebSocket implementation with proper cleanup
+- AMQP messaging with connection pooling and TLS
+
+### Fixed
+- Test compilation errors in audio processing
+- WebSocket null pointer dereferences
+- Parser namespace issues in tests
+- Memory leaks in audio processing pipeline
+- Build errors with missing dependencies
+
+## [0.3.0] - 2025-07-01
+
+### Added
+- **Pause/Resume Control API**: Comprehensive REST API for controlling recording and transcription
+  - Real-time pause and resume of individual sessions or all active sessions
+  - Granular control: pause recording, transcription, or both independently
+  - Secure API key authentication with configurable access control
+  - Per-session and global pause/resume operations
+  - Status monitoring with pause duration metrics
+- **PII Detection & Redaction**: Automatic detection and redaction of personally identifiable information
+  - Real-time detection of SSNs, credit card numbers, phone numbers, and email addresses
+  - Advanced validation using Luhn algorithm for credit cards and SSN format validation
+  - Configurable redaction with format preservation options
+  - Transcription filtering with real-time PII redaction
+  - Audio timeline marking for post-processing PII redaction
+  - Thread-safe processing with race condition prevention
+  - Integration with WebSocket and AMQP transcription delivery
+- **Thread-Safe Stream Control**: Implementation of pausable I/O streams
+  - PausableWriter for recording streams that drops data when paused
+  - PausableReader for transcription streams that blocks reads when paused
+  - Mutex-protected operations for concurrent safety
+- **Enhanced Session Management**: Extended RTPForwarder with pause/resume state and PII audio marking
+  - Thread-safe pause/resume methods with proper synchronization
+  - Real-time status tracking with pause timestamps and duration
+  - Seamless integration with existing STT providers
+  - PII audio marker integration for timeline-based redaction
+- **Monitoring and Metrics**: Comprehensive observability for pause/resume and PII operations
+  - Prometheus metrics for pause/resume events and durations
+  - PII detection metrics and performance monitoring
+  - Structured logging with session context and operation details
+  - Real-time status endpoints for monitoring active sessions
+- **Configuration System**: Full environment variable and JSON configuration support
+  - Configurable authentication, timeouts, and default behaviors
+  - Optional maximum pause duration with auto-resume capability
+  - Granular control over recording vs transcription pause behavior
+  - Comprehensive PII detection configuration options
+
+### Enhanced
+- **API Architecture**: Extended HTTP server with new REST endpoints
+- **Session Store**: Enhanced ShardedMap with Keys() method for session enumeration
+- **Documentation**: Comprehensive API documentation with usage examples
+- **Testing**: Complete unit and integration test coverage for all pause/resume functionality
+
+### Technical
+- **Thread Safety**: All operations use proper mutex synchronization
+- **Performance**: Minimal overhead with immediate effect pause/resume operations
+- **Reliability**: Non-blocking operations that don't affect other session functionality
+- **Security**: Optional API key authentication with audit logging
+
+## [0.2.0] - 2025-05-23
+
+### Added
+- **End-to-End Encryption**: Optional AES-256-GCM and ChaCha20-Poly1305 encryption for audio recordings and session metadata
+- **Automatic Key Management**: Secure key generation, rotation, and storage with configurable intervals
+- **Multiple Key Stores**: File-based persistent storage and memory-based volatile storage options
+- **Encrypted File Format**: Custom `.siprec` format with encryption headers and chunk-based storage
+- **Session Isolation**: Independent encryption contexts for each recording session
+- **Key Rotation Service**: Automated background service for key rotation with configurable intervals
+- **Comprehensive Encryption Tests**: Unit, integration, and performance tests for all encryption functionality
+- **Encryption Documentation**: Complete guide with usage examples, security considerations, and best practices
+- **Configuration Integration**: Full environment variable configuration with validation and defaults
+- **Docker Integration**: Enhanced Docker containerization with multi-stage builds and testing
+- **STT Provider Integration**: Comprehensive testing for Amazon Transcribe, Azure Speech, Google Speech, and Mock providers
+
+### Enhanced
+- **Security**: Added forward secrecy through automatic key rotation
+- **Testing Suite**: Expanded with integration tests for STT providers and comprehensive unit tests
+- **Documentation**: Updated with encryption capabilities and configuration options
+- **Docker Support**: Production-ready multi-stage builds with security hardening
+- **Build System**: Enhanced Makefile with cross-platform support and quality assurance
+
+### Security
+- **Authenticated Encryption**: AEAD modes prevent tampering with encrypted data
+- **Secure Defaults**: Strong cryptographic parameters and secure key generation
+- **Session Security**: Per-session encryption contexts with audit logging capabilities
+
+## [0.1.0] - 2025-04-17
+
+### Added
+- Initial release with core SIPREC server functionality
+- RFC 7245 compliant session redundancy implementation
+- SIP Dialog replacement support via Replaces header
+- TLS and SRTP security for signaling and media
+- Concurrent session handling with sharded maps
+- Memory optimization with RTP buffer pooling
+- Production-ready Prometheus metrics
+- Basic health check API
+- Docker and docker-compose support
+- Comprehensive testing suite
+
+### Optimized
+- Concurrent session handling using sharded maps in `pkg/sip/handler.go`
+- Reduced lock contention for better scaling with many concurrent calls
+- Efficient memory usage with buffer pooling for RTP packets
+- Better performance under high load with concurrent processing
+
+## [Unreleased]
+
+### Added
+- **SIP_HOST Configuration**: Added configurable SIP server bind address
+  - Set bind address via SIP_HOST environment variable (default: "0.0.0.0")
+  - Affects Via and Contact headers in SIP responses
+  - Enables binding to specific network interfaces
+
+### Enhanced
+- **Infrastructure Package Integration**: Fixed and integrated critical monitoring and resilience systems
+  - **pkg/metrics**: Fixed broken metrics system - was being referenced but never initialized
+    - Added metrics.Init() and metrics.InitEnhancedMetrics() calls
+    - Prometheus endpoint now properly exposes all RTP, SIP, STT, and AMQP metrics
+    - Fixed null/empty metrics response issue
+  - **pkg/circuitbreaker**: Integrated circuit breaker protection for all STT providers
+    - Wrapped all 7 STT providers (Google, Deepgram, Azure, Amazon, OpenAI, Speechmatics, ElevenLabs)
+    - Automatic failure detection and recovery
+    - Prevents cascading failures when providers are unavailable
+    - Configurable thresholds and timeout periods
+  - **pkg/performance**: Integrated real-time performance monitoring
+    - Memory usage tracking with automatic GC triggering
+    - Goroutine leak detection
+    - CPU usage monitoring with configurable limits
+    - Proper initialization and graceful shutdown
+  - **pkg/auth**: Integrated authentication and authorization system
+    - JWT token authentication with configurable expiry
+    - API key authentication for service-to-service communication
+    - Simple in-memory user management with role-based permissions
+    - Configurable admin credentials via environment variables
+    - Disabled by default, enable via AUTH_ENABLED=true
+  - **pkg/warnings**: Integrated centralized warning collection system
+    - Global warning collector for system-wide warning aggregation
+    - Severity levels (INFO, LOW, MEDIUM, HIGH, CRITICAL)
+    - Warning deduplication and suppression capabilities
+    - Automatic cleanup of old resolved warnings
+    - Recommended actions for common warning categories
+  - **pkg/alerting**: Integrated multi-channel alerting system
+    - Configurable alert evaluation with periodic rule checking
+    - Support for multiple notification channels (Slack, PagerDuty, Email, Webhook)
+    - Alert rules with thresholds and severity levels
+    - Disabled by default pending alert rules and channel configuration
+    - Enable via ALERTING_ENABLED=true
+- **Contact Header Fix**: SIP Contact headers now use actual configured port
+  - Tracks listen addresses per transport (UDP/TCP/TLS)
+  - Resolves correct host:port considering NAT configuration
+  - Fixes issue where Contact showed :5060 instead of configured port
+- **UDP MTU Handling**: Increased UDP MTU to 4096 bytes for large SIPREC messages
+  - Combined with compact XML format for maximum efficiency
+  - Prevents packet fragmentation issues
+- **RFC 7865 Compliance**: Improved SIPREC metadata validation
+  - Missing state attribute now treated as warning instead of error
+  - Added "unknown" as valid recording state for RFC 7865-only implementations
+  - Support for participantsessionassoc elements
+  - Enhanced validation distinguishes between RFC 7865 and RFC 7866 requirements
+- **Encryption Configuration**: Changed ENCRYPTION_KEY_STORE default from "file" to "memory"
+  - Enables out-of-box operation without file path configuration
+  - Memory storage suitable for development and testing environments
+  - File and vault storage remain available for production use
+- **Message Size Optimization**: Compact XML format prevents MTU exceeded errors
+  - Changed from indented to compact XML for SIPREC metadata responses
+  - Reduces message size by 12-15% to stay within UDP MTU limits
+  - Fixes "size of packet larger than MTU" SIP 200 OK response failures
+
+### Fixed
+- SIP 200 OK responses failing due to MTU size exceeded on UDP transport
+- SIPREC metadata with missing state attribute incorrectly rejected as critical error
+- App startup failures when ENCRYPTION_KEY_STORE not configured
+- Broken metrics endpoint returning empty data due to uninitialized registry
+- Contact headers showing wrong port number in SIP responses
+
+### Notes
+- **Remaining Unintegrated Packages**: The following packages are implemented but not yet integrated:
+  - `pkg/clustering`: Redis-based multi-instance clustering (requires Redis setup and configuration)
+  - `pkg/failover`: Session failover system (depends on clustering infrastructure)
+  - `pkg/app`, `pkg/core`, `pkg/util` (legacy): Utility packages with minimal value
+  - These packages can be integrated when their specific features are needed
+- **Recently Integrated Packages**: pkg/auth, pkg/warnings, and pkg/alerting are now integrated and available for use
+
+### Added - Resource Optimization & Advanced Features
+- **Advanced Resource Optimization**: Comprehensive memory and CPU optimization for 1000+ concurrent sessions
+- **Memory Pool Management**: Intelligent buffer pooling reducing GC pressure by 50-70%
+- **Worker Pool Architecture**: Dynamic goroutine scaling with category-specific pools
+- **Session Caching**: LRU cache with TTL for frequently accessed sessions
+- **Sharded Data Structures**: 64-shard maps for reduced lock contention
+- **Enhanced Port Management**: RTP port reuse optimization with allocation statistics
+- **Optimized Audio Processing**: Frame-based processing with multi-channel support
+- **Advanced Session Manager**: High-performance session management with asynchronous operations
+
+### Added - SIPREC Protocol Enhancements
+- **Complete SIPREC Metadata Handling**: Full RFC 7865/7866 metadata schema support
+- **Advanced Participant Management**: Complex participant configurations with roles and AORs
+- **Stream Configuration**: Audio/video stream management with mixing support
+- **Session State Transitions**: Pause/resume with sequence tracking and validation
+- **Comprehensive Validation**: Detailed metadata validation with error reporting
+- **Response Generation**: RFC-compliant multipart MIME response creation
+- **Session Control Operations**: PauseRecording(), ResumeRecording(), and state management
+
+### Added - Codec & Media Support
+- **Enhanced Codec Support**: Full Opus and EVS codec implementations with decoding
+- **Media Quality Metrics**: ITU-T G.107 E-model for MOS score calculation
+- **Adaptive Bitrate Control**: Network-aware dynamic bitrate adjustment
+- **Multi-Channel Audio**: Stereo enhancement, channel separation, and mixing
+- **Audio Processing Pipeline**: Noise reduction, echo cancellation, and VAD
+
+### Added - Infrastructure & Monitoring
+- **Real-time transcription streaming to AMQP message queues**
+- **Production-ready AMQP implementation** with fault tolerance and graceful degradation
+- **Comprehensive Performance Metrics**: Memory, session, worker pool, and cache statistics
+- **Resource Utilization Monitoring**: Real-time tracking of system resources
+- **Health Check APIs**: Detailed health and performance monitoring endpoints
+- **Enhanced Testing Suite**: Resource optimization and SIPREC metadata testing
+
+### Optimized
+- **Concurrent Session Handling**: 64-shard session storage for reduced lock contention
+- **Memory Efficiency**: Object pooling and buffer reuse for zero-allocation hot paths
+- **Audio Processing**: Frame-based processing reducing memory pressure
+- **Network Operations**: Enhanced RTP port management with reuse tracking
+- **Session Lookup**: Sub-millisecond session access through intelligent caching
+
+### Fixed
+- Fixed potential nil pointer dereference in SDP handler when no SDP content is provided
+- Added generateDefaultSDP function to properly handle nil SDP cases
+- Updated prepareSdpResponse function to handle empty or nil SDP inputs
+- Simplified SDP generation code by consolidating to the generateSDPAdvanced function
+- Resolved import cycles in resource optimization modules
+
+### Changed
+- **Refactored session management** for high-concurrency optimization
+- **Enhanced SIPREC parser** with comprehensive metadata validation
+- **Improved SDP handling** code for better maintainability and robustness
+- **Updated project structure** to include resource optimization utilities
+- **Enhanced documentation** with performance optimization guide

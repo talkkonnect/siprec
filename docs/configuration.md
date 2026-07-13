@@ -1,0 +1,974 @@
+# Configuration
+
+IZI SIPREC supports multiple configuration methods with the following priority order (highest to lowest):
+
+1. **Environment variables** - Always take precedence
+2. **Configuration file** (YAML/JSON) - Production-ready structured configuration
+3. **`.env` file** - Development convenience
+4. **Built-in defaults** - Sensible defaults for all settings
+
+## Configuration File (Recommended for Production)
+
+For production deployments, use a YAML or JSON configuration file. The server automatically searches for configuration files in these locations:
+
+1. Path specified in `CONFIG_FILE` environment variable
+2. `./config.yaml` or `./config.yml` or `./config.json` (current directory)
+3. `/etc/siprec/config.yaml` or `/etc/siprec/config.yml` or `/etc/siprec/config.json`
+4. `$HOME/.siprec/config.yaml` or `$HOME/.siprec/config.yml` or `$HOME/.siprec/config.json`
+
+### Minimal Configuration Example
+
+```yaml
+# config.yaml - Minimal configuration (defaults apply for missing values)
+network:
+  host: "0.0.0.0"
+  ports:
+    - 5060
+
+http:
+  port: 8080
+
+logging:
+  level: "info"
+```
+
+### Full Configuration Example
+
+```yaml
+# config.yaml - Production configuration
+network:
+  external_ip: "auto"
+  internal_ip: "auto"
+  host: "0.0.0.0"
+  ports:
+    - 5060
+    - 5061
+  rtp_port_min: 10000
+  rtp_port_max: 20000
+  rtp_timeout: 30s
+  enable_tls: false
+  enable_srtp: false
+
+http:
+  port: 8080
+  enabled: true
+  enable_metrics: true
+  enable_api: true
+  read_timeout: 10s
+  write_timeout: 30s
+
+recording:
+  directory: "./recordings"
+  max_duration: 4h
+  cleanup_days: 30
+  combine_legs: true
+  format: "wav"
+  quality: 5
+
+stt:
+  default_vendor: "google"
+  supported_vendors:
+    - "google"
+    - "deepgram"
+    - "azure"
+    - "aws"
+    - "openai"
+  supported_codecs:
+    - "PCMU"
+    - "PCMA"
+    - "G722"
+    - "G729"
+    - "OPUS"
+
+logging:
+  level: "info"
+  format: "json"
+
+resources:
+  max_concurrent_calls: 500
+
+redundancy:
+  enabled: true
+  session_timeout: 30s
+  session_check_interval: 10s
+  storage_type: "memory"  # Use "redis" for production HA
+
+encryption:
+  algorithm: "AES-256-GCM"
+  encryption_key_store: "memory"
+
+performance:
+  enabled: true
+  memory_limit_mb: 512
+  cpu_limit: 80
+  gc_threshold_mb: 100
+  monitor_interval: 30s
+  enable_auto_gc: true
+
+circuit_breaker:
+  enabled: true
+  stt_failure_threshold: 3
+  stt_timeout: 30s
+  stt_request_timeout: 45s
+```
+
+### JSON Configuration
+
+JSON format is also supported:
+
+```json
+{
+  "network": {
+    "host": "0.0.0.0",
+    "ports": [5060, 5061]
+  },
+  "http": {
+    "port": 8080,
+    "enabled": true
+  },
+  "logging": {
+    "level": "info"
+  }
+}
+```
+
+### Using Configuration Files with Docker
+
+```bash
+# Mount config file
+docker run -v /path/to/config.yaml:/etc/siprec/config.yaml ghcr.io/loreste/siprec:latest
+
+# Or specify via environment variable
+docker run -e CONFIG_FILE=/app/config.yaml -v /path/to/config.yaml:/app/config.yaml ghcr.io/loreste/siprec:latest
+```
+
+### Environment Variable Overrides
+
+Environment variables always override configuration file values. This allows you to:
+- Use a base configuration file
+- Override sensitive values (API keys, passwords) via environment variables
+- Customize per-environment settings without modifying the config file
+
+```bash
+# Base config from file, override specific values
+CONFIG_FILE=/etc/siprec/config.yaml
+HTTP_PORT=9090  # Overrides http.port from config file
+LOG_LEVEL=debug  # Overrides logging.level from config file
+```
+
+## Environment Variables Reference
+
+Environment variables can be used standalone or to override configuration file values. The core service only requires SIP bind details; everything else is optional.
+
+## SIP & Networking
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `SIP_HOST` | Listen address for SIP (UDP & TCP) | `0.0.0.0` |
+| `PORTS` | Comma-separated list of SIP ports | `5060,5061` |
+| `BEHIND_NAT` | Enable NAT rewriting (Via/Contact) | `false` |
+| `EXTERNAL_IP` | Public IP override or `auto` for STUN | `auto` |
+| `STUN_SERVER` | Comma-separated STUN servers (host:port) used when `EXTERNAL_IP=auto` | `stun.l.google.com:19302` |
+
+### RTP Configuration
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `RTP_PORT_MIN` / `RTP_PORT_MAX` | RTP port range | `10000-20000` |
+| `RTP_TIMEOUT` | RTP inactivity timeout before cleanup | `30s` |
+| `RTP_BIND_IP` | Bind RTP listener to specific IP (empty = all interfaces) | `` |
+
+**RTP Timeout Configuration:**
+
+The `RTP_TIMEOUT` setting controls how long the server waits for RTP packets before considering a stream dead. This is useful for handling network issues:
+
+- **Default (30s)**: Works for most deployments
+- **Increased timeout (60s-120s)**: For networks with intermittent packet loss or high latency
+- **Decreased timeout (10s-20s)**: For environments where quick cleanup is preferred
+
+```bash
+# Example: Tolerate longer network interruptions
+RTP_TIMEOUT=90s
+
+# Example: Fast cleanup for unstable connections
+RTP_TIMEOUT=15s
+```
+
+**RTP Interface Binding:**
+
+By default, the RTP listener binds to all network interfaces (`0.0.0.0`), which is the most robust configuration. However, you can bind to a specific interface when needed:
+
+```bash
+# Default: Bind to all interfaces (recommended)
+# RTP_BIND_IP=  # (empty or not set)
+
+# Bind to specific private IP
+RTP_BIND_IP=192.168.1.100
+
+# Bind to specific public IP
+RTP_BIND_IP=203.0.113.50
+```
+
+**Use cases for specific interface binding:**
+- **Security**: Restrict RTP to internal network only
+- **Multi-homing**: Server has multiple IPs, bind to specific one
+- **Routing**: Force RTP through specific network path
+- **Firewall**: Bind to IP with specific firewall rules
+
+**Note**: If an invalid IP is provided, the server will fall back to binding on all interfaces and log a warning.
+
+### SIP Authentication & IP Filtering
+
+The server supports SIP Digest authentication and IP-based access control to restrict which SRC devices can send SIPREC sessions.
+
+#### IP-Based Access Control
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `SIP_IP_ACCESS_ENABLED` | Enable IP-based filtering | `false` |
+| `SIP_IP_DEFAULT_ALLOW` | Default policy when IP not in any list | `true` |
+| `SIP_IP_ALLOWED_IPS` | Comma-separated list of allowed IPs | `` |
+| `SIP_IP_ALLOWED_NETWORKS` | Comma-separated list of allowed CIDRs | `` |
+| `SIP_IP_BLOCKED_IPS` | Comma-separated list of blocked IPs | `` |
+| `SIP_IP_BLOCKED_NETWORKS` | Comma-separated list of blocked CIDRs | `` |
+
+**Evaluation Order:**
+1. Check if IP is in blocked list → **DENY**
+2. Check if IP is in blocked network → **DENY**
+3. Check if IP is in allowed list → **ALLOW**
+4. Check if IP is in allowed network → **ALLOW**
+5. Apply default policy (`SIP_IP_DEFAULT_ALLOW`)
+
+**Examples:**
+
+```bash
+# Whitelist mode: Only allow specific SBCs
+SIP_IP_ACCESS_ENABLED=true
+SIP_IP_DEFAULT_ALLOW=false
+SIP_IP_ALLOWED_IPS=192.168.1.10,192.168.1.11
+SIP_IP_ALLOWED_NETWORKS=10.0.0.0/8
+
+# Blacklist mode: Block known bad actors
+SIP_IP_ACCESS_ENABLED=true
+SIP_IP_DEFAULT_ALLOW=true
+SIP_IP_BLOCKED_IPS=203.0.113.50
+SIP_IP_BLOCKED_NETWORKS=198.51.100.0/24
+
+# Production example: Allow internal networks only
+SIP_IP_ACCESS_ENABLED=true
+SIP_IP_DEFAULT_ALLOW=false
+SIP_IP_ALLOWED_NETWORKS=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+```
+
+#### SIP Digest Authentication
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `SIP_AUTH_ENABLED` | Enable SIP Digest authentication | `false` |
+| `SIP_AUTH_REALM` | Authentication realm | `siprec.local` |
+| `SIP_AUTH_NONCE_TIMEOUT` | Nonce validity in seconds | `300` |
+| `SIP_AUTH_USERS` | Comma-separated user:password pairs | `` |
+
+**Example:**
+
+```bash
+# Enable digest authentication
+SIP_AUTH_ENABLED=true
+SIP_AUTH_REALM=mycompany.com
+SIP_AUTH_USERS=sbc1:secretpass1,sbc2:secretpass2
+```
+
+**Combined Example (IP filtering + Digest auth):**
+
+```bash
+# Defense in depth: IP whitelist + digest auth
+SIP_IP_ACCESS_ENABLED=true
+SIP_IP_DEFAULT_ALLOW=false
+SIP_IP_ALLOWED_NETWORKS=10.0.0.0/8
+SIP_AUTH_ENABLED=true
+SIP_AUTH_REALM=secure.example.com
+SIP_AUTH_USERS=sbc-primary:$(cat /run/secrets/sbc_password)
+```
+
+## Recording
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `RECORDING_DIR` | Folder for recorded media | `./recordings` |
+| `RECORDING_MAX_DURATION` | Max duration per call | `4h` |
+| `RECORDING_COMBINE_LEGS` | Merge SIPREC legs into one multi-channel WAV | `true` |
+
+### Audio Format Configuration
+
+The server supports multiple audio output formats via FFmpeg encoding. By default, recordings are saved as WAV files, but you can configure automatic conversion to compressed formats.
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `RECORDING_FORMAT` | Output format: `wav`, `mp3`, `opus`, `ogg`, `mp4`, `m4a`, `flac` | `wav` |
+| `RECORDING_MP3_BITRATE` | MP3 bitrate in kbps | `128` |
+| `RECORDING_OPUS_BITRATE` | Opus bitrate in kbps | `64` |
+| `RECORDING_QUALITY` | Quality setting 1-10 (higher = better) | `5` |
+
+**Supported Formats:**
+
+| Format | Codec | Use Case |
+| --- | --- | --- |
+| `wav` | PCM | Lossless, maximum compatibility |
+| `mp3` | LAME MP3 | Good compression, universal playback |
+| `opus` | Opus | Excellent compression, VoIP optimized |
+| `ogg` | Opus in OGG | Opus in OGG container |
+| `mp4` | AAC | Modern container format |
+| `m4a` | AAC | Apple-compatible audio |
+| `flac` | FLAC | Lossless compression |
+
+**Requirements:**
+- FFmpeg must be installed and available in PATH for non-WAV formats
+- If FFmpeg is not available, the server falls back to WAV format
+
+**Examples:**
+```bash
+# High-quality MP3 recordings
+RECORDING_FORMAT=mp3
+RECORDING_MP3_BITRATE=192
+RECORDING_QUALITY=8
+
+# Bandwidth-efficient Opus recordings
+RECORDING_FORMAT=opus
+RECORDING_OPUS_BITRATE=48
+RECORDING_QUALITY=7
+
+# Lossless FLAC compression
+RECORDING_FORMAT=flac
+RECORDING_QUALITY=8
+```
+
+### Per-Call Timeout Configuration
+
+In addition to global timeout settings, the server supports per-call timeout overrides via SIP headers or SIPREC metadata. This allows SRC devices to specify custom timeouts for specific recordings.
+
+**SIP Headers for Per-Call Timeouts:**
+
+| Header | Description | Example |
+| --- | --- | --- |
+| `X-Recording-Timeout` | RTP inactivity timeout for this call | `X-Recording-Timeout: 60s` |
+| `X-Recording-Max-Duration` | Maximum recording duration for this call | `X-Recording-Max-Duration: 2h` |
+| `X-Recording-Retention` | Retention period for this recording | `X-Recording-Retention: 30d` |
+
+**SIPREC Metadata:**
+
+Per-call timeouts can also be specified in the SIPREC metadata XML:
+
+```xml
+<recording xmlns="urn:ietf:params:xml:ns:recording:1">
+  <session>
+    <siprecTimeout>90s</siprecTimeout>
+    <siprecMaxDuration>1h</siprecMaxDuration>
+    <siprecRetention>7d</siprecRetention>
+  </session>
+</recording>
+```
+
+**Priority Order:**
+1. SIP headers (highest priority)
+2. SIPREC metadata
+3. Global configuration (lowest priority)
+
+**Example: Per-Call Override via SIP INVITE:**
+```
+INVITE sip:recorder@192.168.1.100:5060 SIP/2.0
+Via: SIP/2.0/UDP 192.168.1.50:5060
+From: <sip:src@192.168.1.50>;tag=abc123
+To: <sip:recorder@192.168.1.100>
+Call-ID: call-12345@192.168.1.50
+X-Recording-Timeout: 120s
+X-Recording-Max-Duration: 30m
+Content-Type: multipart/mixed;boundary=boundary1
+```
+
+## Recording Storage
+
+Recordings can be uploaded to cloud object storage (S3, GCS, or Azure Blob) after each call.
+Enable uploads with `RECORDING_STORAGE_ENABLED=true` and configure one or more backends. Set
+`RECORDING_STORAGE_KEEP_LOCAL=false` to delete the local copy once the upload succeeds.
+
+```bash
+RECORDING_STORAGE_ENABLED=true
+RECORDING_STORAGE_KEEP_LOCAL=false
+RECORDING_STORAGE_AZURE_ENABLED=true
+RECORDING_STORAGE_AZURE_ACCOUNT=mystorageaccount
+RECORDING_STORAGE_AZURE_CONTAINER=recordings
+RECORDING_STORAGE_AZURE_PREFIX=poc            # optional path prefix inside the container
+RECORDING_STORAGE_AZURE_SAS_TOKEN=...         # recommended (see below)
+```
+
+### Azure Blob Storage Authentication
+
+Exactly **one** authentication method must be configured when Azure storage is enabled. The
+server picks the first one that is set, in this order:
+
+1. **SAS token** (`RECORDING_STORAGE_AZURE_SAS_TOKEN`) — **recommended**
+2. **Account key** (`RECORDING_STORAGE_AZURE_ACCESS_KEY`) — discouraged
+
+#### Why a SAS token instead of the account key
+
+The storage **account key** grants full read/write/delete access to the *entire* storage
+account — every container, every blob. Leaking it compromises all data in the account, and it
+cannot be scoped or given an expiry (only rotated).
+
+A **service SAS token** can be restricted to a single container, limited to just the
+permissions the recorder needs (create + write, no read/delete), and given an expiry date.
+This follows the principle of least privilege: even if the token leaks, the blast radius is one
+container until it expires.
+
+#### Recommended: generate a container-scoped SAS token
+
+Create a SAS for exactly the target container with create/write permissions and a sensible
+expiry (adjust account, container, and expiry to your needs):
+
+```bash
+az storage container generate-sas \
+  --account-name mystorageaccount \
+  --name recordings \
+  --permissions cw \          # c = create, w = write (no read/delete)
+  --expiry 2027-01-01T00:00:00Z \
+  --https-only \
+  --auth-mode key \
+  --account-key "<account-key-used-only-to-mint-the-sas>" \
+  --output tsv
+```
+
+Put the resulting token (the query string, with or without a leading `?`) into
+`RECORDING_STORAGE_AZURE_SAS_TOKEN`. The account key is only needed once to mint the SAS and
+does not have to live on the recording server.
+
+> The server never logs the SAS token, and blob location URLs it emits are built from the
+> account/container/blob names only — the SAS query string is never included.
+
+#### Account key (not recommended)
+
+If you must use the account key, set `RECORDING_STORAGE_AZURE_ACCESS_KEY`. The server logs a
+warning at startup recommending a SAS token. When using an account key, at minimum:
+
+- **Rotate** the key regularly.
+- Restrict the storage account with **network firewall rules** (allowed IP ranges / VNet) so
+  the key is only usable from the recorder's network.
+
+## Session Persistence
+
+To persist session data across restarts, initialise a session manager store (e.g. Redis) and pass it to the SIP handler through code:
+
+```go
+redisStore, _ := session.NewRedisSessionStore(redisConfig, logger)
+
+handlerConfig := &sip.Config{
+    SessionStore:  redisStore,
+    SessionNodeID: "recorder-1",
+}
+handler, _ := sip.NewHandler(logger, handlerConfig, sttManager)
+```
+
+Redis connection parameters can be set via:
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `REDIS_ENABLED` | Enable Redis-backed session store | `false` |
+| `REDIS_ADDRESS` | Redis endpoint | `localhost:6379` |
+| `REDIS_PASSWORD` | Password (optional) | `""` |
+| `REDIS_DATABASE` | Database index | `0` |
+| `REDIS_SESSION_TTL` | TTL for stored sessions | `24h` |
+
+## High Availability & Redundancy
+
+The server supports session redundancy to handle failovers without losing call state. This allows a backup instance to take over if the primary fails.
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `ENABLE_REDUNDANCY` | Enable session redundancy | `true` |
+| `REDUNDANCY_STORAGE_TYPE` | Storage backend (`memory`, `redis`) | `memory` |
+| `SESSION_TIMEOUT` | Time until an inactive session is considered dead | `30s` |
+| `SESSION_CHECK_INTERVAL` | Frequency of stale session checks | `10s` |
+
+> **Note**: For production HA, set `REDUNDANCY_STORAGE_TYPE=redis` so that multiple instances can share session state.
+
+## Speech-to-Text (Optional)
+
+The project exposes hooks for a provider manager. Each provider has its own credentials (see `pkg/stt`). Typical variables include:
+
+| Variable | Description |
+| --- | --- |
+| `DEFAULT_SPEECH_VENDOR` | Preferred provider (e.g. `google`) |
+| `SUPPORTED_VENDORS` | Comma-separated provider list |
+| Provider-specific keys | e.g. Google service-account JSON, Deepgram API key |
+
+Leave the manager unset to run the recorder without STT streaming.
+
+### Whisper CLI (on-prem)
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `WHISPER_ENABLED` | Enable the `whisper` vendor | `false` |
+| `WHISPER_BINARY_PATH` | CLI path (e.g. `/usr/local/bin/whisper`) | `whisper` |
+| `WHISPER_MODEL` | Model name (`tiny`, `base`, `small`, `medium`, `large`) | `base` |
+| `WHISPER_TASK` | `transcribe` or `translate` | `transcribe` |
+| `WHISPER_TRANSLATE` | Force translate mode (overrides task) | `false` |
+| `WHISPER_LANGUAGE` | Force language (empty for auto-detect) | `""` |
+| `WHISPER_OUTPUT_FORMAT` | CLI output format (`json`, `txt`, `srt`, `vtt`, `tsv`, `verbose_json`) | `json` |
+| `WHISPER_SAMPLE_RATE` | Sample rate for the buffered WAV | `16000` |
+| `WHISPER_CHANNELS` | Channel count for the WAV | `1` |
+| `WHISPER_TIMEOUT` | Maximum runtime per call | `10m` |
+| `WHISPER_MAX_CONCURRENT` | Max concurrent calls (`-1`=auto, `0`=unlimited, `N`=limit) | `-1` |
+| `WHISPER_EXTRA_ARGS` | Additional CLI arguments (e.g., `--device cuda --fp16 True`) | `""` |
+
+**Remote Server Example**:
+```bash
+# Whisper running on separate GPU server
+WHISPER_ENABLED=true
+WHISPER_BINARY_PATH=/usr/local/bin/whisper-remote  # SSH or HTTP wrapper
+WHISPER_MODEL=large
+WHISPER_TIMEOUT=20m  # Increased for network latency
+WHISPER_MAX_CONCURRENT=16  # GPU server can handle more
+```
+
+See [Speech-to-Text Integration](stt.md) for detailed Whisper configuration including GPU acceleration, remote servers, and performance tuning.
+
+## HTTP Server
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `HTTP_ENABLED` | Expose health/control endpoints | `true` |
+| `HTTP_PORT` | HTTP listen port | `8080` |
+
+Health (`/health`, `/health/live`) and readiness (`/health/ready`) checks automatically reflect the SIP handler and shared session store.
+
+### API Authentication & RBAC
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `AUTH_ENABLED` | Enable HTTP API authentication (JWT and API keys) | `false` |
+| `AUTH_JWT_SECRET` | JWT signing secret (required when auth is enabled) | - |
+| `AUTH_ENABLE_API_KEYS` | Allow API key authentication | `true` |
+| `AUTH_RBAC_ENABLED` | Enforce role-based access control on API endpoints (requires `AUTH_ENABLED=true` and database persistence) | `false` |
+
+### Async STT Job Queue
+
+The async STT processor powers the `/api/stt/*` job endpoints (see [API Reference](api.md)).
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `STT_ASYNC_ENABLED` | Enable the async transcription job queue | `true` |
+| `STT_WORKER_COUNT` | Number of transcription workers | `3` |
+| `STT_MAX_RETRIES` | Maximum retries per job | `3` |
+| `STT_RETRY_BACKOFF` | Delay between retries | `30s` |
+| `STT_JOB_TIMEOUT` | Per-job timeout | `300s` |
+
+### Rate Limiting
+
+Rate limiting protects the server from DDoS attacks and abuse. Both HTTP API and SIP requests can be rate-limited.
+
+#### HTTP Rate Limiting
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `RATE_LIMIT_ENABLED` | Enable HTTP rate limiting | `false` |
+| `RATE_LIMIT_RPS` | Requests per second per client | `100` |
+| `RATE_LIMIT_BURST` | Maximum burst size | `200` |
+| `RATE_LIMIT_BLOCK_DURATION` | How long to block after exceeding limits | `1m` |
+| `RATE_LIMIT_WHITELIST_IPS` | IPs/CIDRs that bypass rate limiting | `127.0.0.1,::1` |
+| `RATE_LIMIT_WHITELIST_PATHS` | Paths that bypass rate limiting | `/health,/health/live,/health/ready` |
+
+**Example configurations:**
+
+```bash
+# Production: Enable rate limiting with standard settings
+RATE_LIMIT_ENABLED=true
+RATE_LIMIT_RPS=100
+RATE_LIMIT_BURST=200
+RATE_LIMIT_BLOCK_DURATION=1m
+
+# High-traffic API: Allow more requests
+RATE_LIMIT_ENABLED=true
+RATE_LIMIT_RPS=500
+RATE_LIMIT_BURST=1000
+RATE_LIMIT_WHITELIST_IPS=10.0.0.0/8,192.168.0.0/16
+
+# Strict mode: Lower limits for public-facing servers
+RATE_LIMIT_ENABLED=true
+RATE_LIMIT_RPS=20
+RATE_LIMIT_BURST=50
+RATE_LIMIT_BLOCK_DURATION=5m
+```
+
+#### SIP Rate Limiting
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `RATE_LIMIT_SIP_ENABLED` | Enable SIP rate limiting | `false` |
+| `RATE_LIMIT_SIP_INVITE_RPS` | INVITE requests per second per IP | `10` |
+| `RATE_LIMIT_SIP_INVITE_BURST` | Maximum INVITE burst | `50` |
+| `RATE_LIMIT_SIP_RPS` | Other SIP requests per second per IP | `100` |
+| `RATE_LIMIT_SIP_REQUEST_BURST` | Maximum general request burst | `200` |
+
+**SIP rate limiting notes:**
+- INVITE requests have stricter limits since they consume more resources
+- Other methods (BYE, ACK, OPTIONS) use the general request limits
+- Whitelisted IPs from HTTP rate limiting also apply to SIP
+
+```bash
+# Protect against SIP flooding attacks
+RATE_LIMIT_SIP_ENABLED=true
+RATE_LIMIT_SIP_INVITE_RPS=10
+RATE_LIMIT_SIP_INVITE_BURST=50
+
+# Whitelist trusted SBC IPs
+RATE_LIMIT_WHITELIST_IPS=192.168.1.10,192.168.1.11,10.0.0.0/8
+```
+
+**Rate limit metrics:**
+
+When rate limiting is enabled, the following Prometheus metrics are exported:
+
+| Metric | Description |
+| --- | --- |
+| `siprec_rate_limit_requests_total` | Total requests processed by rate limiter |
+| `siprec_rate_limit_blocked_total` | Total requests blocked by rate limiter |
+| `siprec_rate_limit_bucket_tokens` | Current tokens in rate limit bucket |
+| `siprec_sip_rate_limited_total` | SIP requests blocked by rate limiter |
+
+### Request Correlation IDs
+
+Correlation IDs enable distributed tracing and request tracking across the system. Every HTTP and SIP request is assigned a unique correlation ID that flows through the entire request lifecycle.
+
+**Features:**
+- Automatic correlation ID generation for all requests
+- Support for incoming correlation IDs via standard headers
+- Correlation IDs included in all log entries
+- Correlation IDs returned in HTTP response headers
+- SIP responses include correlation ID in custom header
+
+**HTTP Headers:**
+| Header | Description |
+| --- | --- |
+| `X-Correlation-ID` | Primary correlation ID header (request/response) |
+| `X-Request-ID` | Alternative correlation ID header (request/response) |
+| `X-Trace-ID` | OpenTelemetry-compatible trace ID (request only) |
+
+**SIP Headers:**
+| Header | Description |
+| --- | --- |
+| `X-Correlation-ID` | Correlation ID for SIP request tracking |
+
+**Usage:**
+- Send `X-Correlation-ID` header with requests to use your own correlation ID
+- If no correlation ID is provided, one is automatically generated
+- Use correlation IDs to trace requests across logs and systems
+- Correlation IDs appear in all audit logs for security events
+
+**Example log entry:**
+```json
+{
+  "correlation_id": "1704531234567-a1b2c3d4-0001",
+  "client_ip": "192.168.1.100",
+  "method": "POST",
+  "path": "/api/sessions",
+  "status": 200,
+  "duration_ms": 45
+}
+```
+
+## Audio Processing & VAD
+
+Basic audio enhancement can be applied before transcription.
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `AUDIO_ENHANCEMENT_ENABLED` | Enable audio enhancement pipeline | `true` |
+| `NOISE_SUPPRESSION_ENABLED` | Enable noise suppression | `true` |
+| `VAD_THRESHOLD` | Energy threshold for speech detection (0.0-1.0) | `0.3` |
+| `NOISE_SUPPRESSION_LEVEL` | Aggressiveness of noise reduction (0.0-1.0) | `0.7` |
+| `AGC_ENABLED` | Enable Automatic Gain Control | `true` |
+| `ECHO_CANCELLATION_ENABLED` | Enable Acoustic Echo Cancellation | `true` |
+
+
+## PII Detection & Redaction
+
+The server can detect and redact Personally Identifiable Information (PII) from transcripts and mark it in audio.
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `PII_DETECTION_ENABLED` | Master switch for PII subsystem | `false` |
+| `PII_ENABLED_TYPES` | Comma-separated types: `ssn,credit_card,phone,email` | `ssn,credit_card` |
+| `PII_REDACTION_CHAR` | Character used for masking (e.g. `*` or `#`) | `*` |
+| `PII_PRESERVE_FORMAT` | If `true`, keeps separators (e.g. `***-**-1234`) | `true` |
+| `PII_APPLY_TO_TRANSCRIPTIONS`| Redact text in real-time streams | `true` |
+| `PII_APPLY_TO_RECORDINGS` | Mark audio metadata for post-processing redaction | `false` |
+
+
+## End-to-End Encryption
+
+Secure your data both in transit and at rest.
+
+### Transport Layer
+| Variable | Description | Default |
+| --- | --- | --- |
+| `ENABLE_TLS` | Enable TLS for SIP signaling | `false` |
+| `TLS_CERT_PATH` | Path to server certificate (PEM) | `` |
+| `TLS_KEY_PATH` | Path to private key (PEM) | `` |
+| `SIP_REQUIRE_TLS` | Reject non-TLS connections | `false` |
+| `ENABLE_SRTP` | Enable SRTP for media (SDES key exchange) | `false` |
+| `SIP_REQUIRE_SRTP` | Reject non-SRTP media sessions | `false` |
+
+### Storage Layer (At-Rest)
+| Variable | Description | Default |
+| --- | --- | --- |
+| `ENABLE_RECORDING_ENCRYPTION` | Encrypt WAV files before writing to disk | `false` |
+| `ENABLE_METADATA_ENCRYPTION` | Encrypt session metadata JSON | `false` |
+| `ENCRYPTION_ALGORITHM` | `AES-256-GCM` or `ChaCha20-Poly1305` | `AES-256-GCM` |
+| `MASTER_KEY_PATH` | Directory for encryption keys | `./keys` |
+| `KEY_ROTATION_INTERVAL` | Time before rotating active key | `24h` |
+
+## Audit Trail & SIP Headers Logging
+
+The server maintains a comprehensive audit trail for compliance and troubleshooting. All SIP-related events now include complete SIP header information for full traceability.
+
+### Audit Events
+
+The following events are automatically logged with SIP header information:
+
+| Event | Description | Headers Included |
+| --- | --- | --- |
+| `sip.invite.success` | Successful SIPREC session establishment | Full INVITE headers |
+| `sip.invite.failure` | Failed session establishment | Full INVITE headers + error details |
+| `sip.bye.received` | BYE received from SRC | Full BYE headers |
+| `sip.cancel.received` | CANCEL received before session established | Full CANCEL headers |
+| `recording.started` | Recording stream started | Session metadata |
+| `recording.stopped` | Recording stream stopped | Session metadata + duration |
+
+### Captured SIP Headers
+
+Each audit event captures the following SIP header categories:
+
+**Core Headers:**
+- `Method`, `Request-URI`, `From`, `To`, `Call-ID`, `CSeq`, `Via`, `Contact`
+
+**Authentication Headers:**
+- `Authorization`, `Proxy-Authorization`, `WWW-Authenticate`
+
+**Routing Headers:**
+- `Route`, `Record-Route`
+
+**Session Headers:**
+- `Allow`, `Supported`, `Require`, `User-Agent`, `Server`
+
+**Media Headers:**
+- `Content-Type`, `Content-Length`, `Accept`
+
+**Transport Info:**
+- Transport protocol (UDP/TCP/TLS), Remote address, Local address
+
+**Custom Headers:**
+- Any vendor-specific or custom headers (e.g., `X-Recording-*`)
+
+### Audit Log Format
+
+Audit events are logged in structured JSON format with the `audit: true` field for easy filtering:
+
+```json
+{
+  "audit": true,
+  "audit_category": "sip",
+  "audit_action": "invite.success",
+  "audit_outcome": "success",
+  "call_id": "call-12345@192.168.1.50",
+  "session_id": "sess-abc123",
+  "tenant": "customer-1",
+  "timestamp": "2024-01-15T10:30:45.123456789Z",
+  "sip_method": "INVITE",
+  "sip_from": "<sip:agent@pbx.example.com>;tag=xyz",
+  "sip_to": "<sip:recorder@srs.example.com>",
+  "sip_via": "SIP/2.0/UDP 192.168.1.50:5060;branch=z9hG4bK-abc",
+  "sip_user_agent": "Cisco-Gateway/1.0",
+  "sip_remote_addr": "192.168.1.50:5060"
+}
+```
+
+### Filtering Audit Logs
+
+Use log aggregation tools to filter audit events:
+
+```bash
+# Filter all audit events
+grep '"audit":true' /var/log/siprec.log
+
+# Filter failed sessions
+grep '"audit_outcome":"failure"' /var/log/siprec.log
+
+# Filter by Call-ID
+grep '"call_id":"call-12345"' /var/log/siprec.log
+```
+
+### Security Note
+
+Authorization headers are automatically redacted in audit logs to prevent credential exposure. The redacted format shows `[REDACTED-<length>]` to indicate the header was present without exposing sensitive data.
+
+## AMQP/RabbitMQ Integration
+
+Real-time transcription delivery via AMQP message queues.
+
+### Basic Configuration
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `AMQP_URL` | RabbitMQ connection URL | - |
+| `AMQP_QUEUE_NAME` | Queue name for transcriptions | - |
+| `PUBLISH_PARTIAL_TRANSCRIPTS` | Publish interim results | `true` |
+| `PUBLISH_FINAL_TRANSCRIPTS` | Publish final results | `true` |
+
+**Example:**
+
+```bash
+AMQP_URL=amqp://username:password@rabbitmq:5672/
+AMQP_QUEUE_NAME=transcriptions
+```
+
+### Enhanced Realtime Publisher
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `ENABLE_REALTIME_AMQP` | Enable enhanced realtime publishing | `false` |
+| `REALTIME_QUEUE_NAME` | Queue for realtime events | `siprec_realtime` |
+| `REALTIME_EXCHANGE_NAME` | Exchange name | - |
+| `REALTIME_ROUTING_KEY` | Routing key | `siprec.realtime` |
+| `REALTIME_BATCH_SIZE` | Messages per batch | `10` |
+| `REALTIME_BATCH_TIMEOUT` | Max wait for batch | `1s` |
+| `REALTIME_QUEUE_SIZE` | Internal queue size | `1000` |
+
+### Analytics Publishing
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `PUBLISH_SENTIMENT_UPDATES` | Include sentiment analysis | `true` |
+| `PUBLISH_KEYWORD_DETECTIONS` | Include keyword detection | `true` |
+| `PUBLISH_SPEAKER_CHANGES` | Include speaker events | `true` |
+
+### Connection Pool & Reliability
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `AMQP_MAX_CONNECTIONS` | Connection pool size | `10` |
+| `AMQP_MAX_CHANNELS_PER_CONN` | Channels per connection | `100` |
+| `AMQP_CONNECTION_TIMEOUT` | Connection timeout | `30s` |
+| `AMQP_HEARTBEAT` | Heartbeat interval | `10s` |
+| `AMQP_PUBLISH_TIMEOUT` | Publish timeout | `5s` |
+| `AMQP_PUBLISH_CONFIRM` | Wait for broker ACK | `true` |
+| `AMQP_MAX_RETRIES` | Max retry attempts | `3` |
+| `AMQP_RETRY_DELAY` | Delay between retries | `2s` |
+
+### TLS Security
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `AMQP_TLS_ENABLED` | Enable TLS encryption | `false` |
+| `AMQP_TLS_CERT_FILE` | Client certificate path | - |
+| `AMQP_TLS_KEY_FILE` | Client key path | - |
+| `AMQP_TLS_CA_FILE` | CA certificate path | - |
+| `AMQP_TLS_SKIP_VERIFY` | Skip certificate verification | `false` |
+
+### Dead Letter Queue
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `AMQP_DLX` | Dead letter exchange name | `siprec.dlx` |
+| `AMQP_DLX_ROUTING_KEY` | Dead letter routing key | `failed` |
+| `AMQP_MESSAGE_TTL` | Message time-to-live | `24h` |
+
+**Production Example:**
+
+```bash
+# Connection
+AMQP_URL=amqps://user:pass@rabbitmq.example.com:5671/
+AMQP_QUEUE_NAME=siprec_transcriptions
+
+# Enhanced realtime with batching
+ENABLE_REALTIME_AMQP=true
+REALTIME_BATCH_SIZE=10
+REALTIME_BATCH_TIMEOUT=1s
+
+# Include analytics
+PUBLISH_SENTIMENT_UPDATES=true
+PUBLISH_KEYWORD_DETECTIONS=true
+
+# TLS security
+AMQP_TLS_ENABLED=true
+AMQP_TLS_CA_FILE=/etc/ssl/certs/rabbitmq-ca.pem
+
+# Reliability
+AMQP_MAX_CONNECTIONS=10
+AMQP_PUBLISH_CONFIRM=true
+AMQP_MAX_RETRIES=3
+```
+
+See [Real-time Transcription](realtime-transcription.md) for message formats and consumer examples.
+
+## Real-Time Analytics
+
+### Sentiment Analysis
+
+Sentiment analysis runs automatically on all transcriptions when the analytics pipeline is enabled (`ANALYTICS_ENABLED=true`). Publishing of sentiment updates to AMQP is controlled by `PUBLISH_SENTIMENT_UPDATES` (default `true`).
+
+**Features:**
+- Lexicon-based scoring (50+ positive/negative words)
+- Emotion detection (joy, anger, sadness, fear, love, surprise)
+- Negation handling ("not good" → negative)
+- Intensifier support ("very good" → higher magnitude)
+- Per-speaker sentiment tracking
+
+### Keyword Detection
+
+Keyword detection runs automatically when the analytics pipeline is enabled. Publishing of keyword detections to AMQP is controlled by `PUBLISH_KEYWORD_DETECTIONS` (default `true`).
+
+**Predefined Categories:**
+
+| Category | Keywords |
+| --- | --- |
+| **Financial** | credit card, SSN, bank account, transactions |
+| **Healthcare** | HIPAA, PHI, medical record, patient ID |
+| **Legal** | confidential, attorney-client, litigation |
+| **Security** | password, hack, breach, malware, phishing |
+
+**Custom Keywords** (via config file):
+
+```yaml
+keyword_detection:
+  custom_keywords:
+    internal:
+      - pattern: "project-x"
+        severity: "critical"
+        weight: 0.95
+      - pattern: "secret project"
+        severity: "high"
+        weight: 0.9
+```
+
+### Compliance Monitoring
+
+Real-time compliance rule evaluation.
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `COMPLIANCE_PCI_ENABLED` | Enable PCI DSS safeguards | `false` |
+| `COMPLIANCE_GDPR_ENABLED` | Enable GDPR safeguards and APIs | `false` |
+
+**GDPR Endpoints:**
+- `POST /api/compliance/gdpr/export` - Export user data
+- `DELETE /api/compliance/gdpr/erase` - Erase user data
+- `GET /api/compliance/status` - Compliance status
+
+
+## Alerting
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `ALERTING_ENABLED` | Enable the alert manager | `false` |
+| `ALERTING_EVALUATION_INTERVAL` | Alert rule evaluation interval | `30s` |
+
+Alert notifications can be delivered through email (SMTP), Slack, PagerDuty, and generic webhook channels. The email channel accepts `smtp_host`, `smtp_port`, `username`, `password`, `from`, `to`, and `tls_mode` (`auto`, `implicit`, `starttls`, `none`) settings and reports delivery success/failure metrics.

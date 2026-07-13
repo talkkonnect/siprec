@@ -1,0 +1,207 @@
+package compliance
+
+import (
+	encodingjson "encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	"siprec-server/pkg/database"
+	"siprec-server/pkg/media"
+
+	"github.com/sirupsen/logrus"
+)
+
+// CallDataRepository defines the repository methods needed for GDPR operations.
+type CallDataRepository interface {
+	GetSessionByCallID(callID string) (*database.Session, error)
+	GetParticipantsBySession(sessionID string) ([]*database.Participant, error)
+	GetStreamsBySession(sessionID string) ([]*database.Stream, error)
+	GetTranscriptionsBySession(sessionID string) ([]*database.Transcription, error)
+	GetCDRByCallID(callID string) (*database.CDR, error)
+	DeleteCallData(callID string) error
+}
+
+// GDPRService provides export and erasure capabilities for call data.
+type GDPRService struct {
+	repo      CallDataRepository
+	exportDir string
+	storage   media.RecordingStorage
+	logger    *logrus.Logger
+}
+
+// NewGDPRService creates a new GDPR service instance.
+func NewGDPRService(repo CallDataRepository, exportDir string, storage media.RecordingStorage, logger *logrus.Logger) *GDPRService {
+	return &GDPRService{
+		repo:      repo,
+		exportDir: exportDir,
+		storage:   storage,
+		logger:    logger,
+	}
+}
+
+// maxExportCallIDLength caps the call ID portion of export file names.
+const maxExportCallIDLength = 128
+
+// exportFilenameDisallowed matches every character that is not allowed in the
+// call ID portion of an export file name.
+var exportFilenameDisallowed = regexp.MustCompile(`[^a-zA-Z0-9._-]`)
+
+// sanitizeCallIDForFilename reduces a caller-supplied call ID to a safe file
+// name component: only alphanumerics, dash, underscore and dot are kept,
+// everything else is replaced with an underscore, and the result is capped at
+// maxExportCallIDLength characters.
+func sanitizeCallIDForFilename(callID string) string {
+	sanitized := exportFilenameDisallowed.ReplaceAllString(callID, "_")
+	if len(sanitized) > maxExportCallIDLength {
+		sanitized = sanitized[:maxExportCallIDLength]
+	}
+	if sanitized == "" || strings.Trim(sanitized, ".") == "" {
+		sanitized = "call"
+	}
+	return sanitized
+}
+
+// exportPathFor builds the export file path for a call ID and verifies the
+// result stays strictly within the export directory.
+func (s *GDPRService) exportPathFor(callID string) (string, error) {
+	filename := fmt.Sprintf("%s-%d.json", sanitizeCallIDForFilename(callID), time.Now().Unix())
+
+	exportRoot, err := filepath.Abs(s.exportDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve export directory: %w", err)
+	}
+
+	output, err := filepath.Abs(filepath.Join(exportRoot, filename))
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve export path: %w", err)
+	}
+
+	if !strings.HasPrefix(output, exportRoot+string(os.PathSeparator)) {
+		return "", fmt.Errorf("export path escapes export directory")
+	}
+
+	return output, nil
+}
+
+// ExportBundle represents exported call data.
+type ExportBundle struct {
+	CallID         string                    `json:"call_id"`
+	Session        *database.Session         `json:"session,omitempty"`
+	Participants   []*database.Participant   `json:"participants,omitempty"`
+	Streams        []*database.Stream        `json:"streams,omitempty"`
+	Transcriptions []*database.Transcription `json:"transcriptions,omitempty"`
+	CDR            *database.CDR             `json:"cdr,omitempty"`
+	ExportedAt     time.Time                 `json:"exported_at"`
+}
+
+// ExportCallData writes call data to a JSON bundle and returns the output path.
+func (s *GDPRService) ExportCallData(callID string) (string, error) {
+	if s.repo == nil {
+		return "", fmt.Errorf("repository unavailable")
+	}
+
+	if err := os.MkdirAll(s.exportDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create export directory: %w", err)
+	}
+
+	session, err := s.repo.GetSessionByCallID(callID)
+	if err != nil {
+		return "", err
+	}
+	if session == nil {
+		return "", fmt.Errorf("no session found for call ID %s", callID)
+	}
+
+	participants, err := s.repo.GetParticipantsBySession(session.ID)
+	if err != nil {
+		return "", err
+	}
+
+	streams, err := s.repo.GetStreamsBySession(session.ID)
+	if err != nil {
+		return "", err
+	}
+
+	transcriptions, err := s.repo.GetTranscriptionsBySession(session.ID)
+	if err != nil {
+		return "", err
+	}
+
+	cdr, err := s.repo.GetCDRByCallID(callID)
+	if err != nil {
+		s.logger.WithError(err).Debug("CDR not found for export")
+		cdr = nil
+	}
+
+	bundle := ExportBundle{
+		CallID:         callID,
+		Session:        session,
+		Participants:   participants,
+		Streams:        streams,
+		Transcriptions: transcriptions,
+		CDR:            cdr,
+		ExportedAt:     time.Now().UTC(),
+	}
+
+	output, err := s.exportPathFor(callID)
+	if err != nil {
+		return "", err
+	}
+
+	file, err := os.Create(output) // #nosec G304 -- file name is sanitized and the path is verified to stay within exportDir above
+	if err != nil {
+		return "", fmt.Errorf("failed to create export file: %w", err)
+	}
+	defer file.Close()
+
+	encoder := encodingjson.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(&bundle); err != nil {
+		// Remove partial file to avoid leaving PII data on disk
+		if removeErr := os.Remove(output); removeErr != nil && !os.IsNotExist(removeErr) {
+			s.logger.WithError(removeErr).WithField("path", output).Warn("Failed to remove partial GDPR export file")
+		}
+		return "", fmt.Errorf("failed to encode export bundle: %w", err)
+	}
+
+	s.logger.WithFields(logrus.Fields{
+		"call_id": callID,
+		"path":    output,
+	}).Info("GDPR export created")
+
+	return output, nil
+}
+
+// EraseCallData deletes persisted call data and recording artifacts.
+func (s *GDPRService) EraseCallData(callID string) error {
+	if s.repo == nil {
+		return fmt.Errorf("repository unavailable")
+	}
+
+	var recordingPath string
+	if cdr, err := s.repo.GetCDRByCallID(callID); err == nil && cdr != nil {
+		recordingPath = cdr.RecordingPath
+	}
+
+	if err := s.repo.DeleteCallData(callID); err != nil {
+		return err
+	}
+
+	if recordingPath != "" {
+		if err := os.Remove(recordingPath); err != nil && !os.IsNotExist(err) {
+			s.logger.WithError(err).WithField("path", recordingPath).Warn("Failed to delete recording file during GDPR erase")
+		}
+		if s.storage != nil {
+			if err := s.storage.Delete(callID, nil, recordingPath); err != nil {
+				s.logger.WithError(err).WithField("path", recordingPath).Warn("Failed to delete remote recording copies during GDPR erase")
+			}
+		}
+	}
+
+	s.logger.WithField("call_id", callID).Info("GDPR erase completed")
+	return nil
+}
