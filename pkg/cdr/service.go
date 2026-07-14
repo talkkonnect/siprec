@@ -149,6 +149,14 @@ func (c *CDRService) UpdateSession(sessionID string, updates CDRUpdate) error {
 		redacted := c.redactPII(*updates.CalleeID)
 		cdr.CalleeID = &redacted
 	}
+	if updates.CallerIDName != nil {
+		redacted := c.redactPII(*updates.CallerIDName)
+		cdr.CallerIDName = &redacted
+	}
+	if updates.CalleeIDName != nil {
+		redacted := c.redactPII(*updates.CalleeIDName)
+		cdr.CalleeIDName = &redacted
+	}
 	if updates.RecordingPath != nil {
 		cdr.RecordingPath = *updates.RecordingPath
 	}
@@ -593,16 +601,17 @@ func (c *CDRService) exportCSV(cdrs []*database.CDR, filepath string) error {
 	defer file.Close()
 
 	// Write CSV header
-	header := "id,session_id,call_id,caller_id,callee_id,start_time,end_time,duration,transport,source_ip,codec,participant_count,status\n"
+	header := "id,session_id,call_id,caller_id,callee_id,caller_id_name,callee_id_name,start_time,end_time,duration,transport,source_ip,codec,participant_count,status\n"
 	if _, err := file.WriteString(header); err != nil {
 		return err
 	}
 
 	// Write CDR records
 	for _, cdr := range cdrs {
-		line := fmt.Sprintf("%s,%s,%s,%s,%s,%s,%s,%.2f,%s,%s,%s,%d,%s\n",
+		line := fmt.Sprintf("%s,%s,%s,%s,%s,%s,%s,%s,%s,%.2f,%s,%s,%s,%d,%s\n",
 			cdr.ID, cdr.SessionID, cdr.CallID,
 			stringOrEmpty(cdr.CallerID), stringOrEmpty(cdr.CalleeID),
+			stringOrEmpty(cdr.CallerIDName), stringOrEmpty(cdr.CalleeIDName),
 			cdr.StartTime.Format(time.RFC3339),
 			timeOrEmpty(cdr.EndTime),
 			floatOrZero(cdr.Duration),
@@ -638,6 +647,8 @@ func (c *CDRService) exportXML(cdrs []*database.CDR, filepath string) error {
     <call_id>%s</call_id>
     <caller_id>%s</caller_id>
     <callee_id>%s</callee_id>
+    <caller_id_name>%s</caller_id_name>
+    <callee_id_name>%s</callee_id_name>
     <start_time>%s</start_time>
     <end_time>%s</end_time>
     <duration>%.2f</duration>
@@ -650,6 +661,7 @@ func (c *CDRService) exportXML(cdrs []*database.CDR, filepath string) error {
 `,
 			cdr.ID, cdr.SessionID, cdr.CallID,
 			stringOrEmpty(cdr.CallerID), stringOrEmpty(cdr.CalleeID),
+			stringOrEmpty(cdr.CallerIDName), stringOrEmpty(cdr.CalleeIDName),
 			cdr.StartTime.Format(time.RFC3339),
 			timeOrEmpty(cdr.EndTime),
 			floatOrZero(cdr.Duration),
@@ -698,6 +710,8 @@ func floatOrZero(f *int64) float64 {
 type CDRUpdate struct {
 	CallerID         *string
 	CalleeID         *string
+	CallerIDName     *string // Display name of the calling party
+	CalleeIDName     *string // Display name of the called party
 	RecordingPath    *string
 	Codec            *string
 	SampleRate       *int

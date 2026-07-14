@@ -68,6 +68,8 @@ type CDR struct {
 	CallID           string     `db:"call_id" json:"call_id"`
 	CallerID         *string    `db:"caller_id" json:"caller_id,omitempty"`
 	CalleeID         *string    `db:"callee_id" json:"callee_id,omitempty"`
+	CallerIDName     *string    `db:"caller_id_name" json:"caller_id_name,omitempty"` // Display name of the calling party
+	CalleeIDName     *string    `db:"callee_id_name" json:"callee_id_name,omitempty"` // Display name of the called party
 	StartTime        time.Time  `db:"start_time" json:"start_time"`
 	EndTime          *time.Time `db:"end_time" json:"end_time,omitempty"`
 	Duration         *int64     `db:"duration" json:"duration,omitempty"` // seconds

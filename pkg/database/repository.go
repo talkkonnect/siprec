@@ -552,17 +552,19 @@ func (r *Repository) CreateCDR(cdr *CDR) error {
 
 	query := `
 		INSERT INTO cdr (
-			id, session_id, call_id, caller_id, callee_id, start_time, end_time,
+			id, session_id, call_id, caller_id, callee_id, caller_id_name,
+			callee_id_name, start_time, end_time,
 			duration, recording_path, recording_size, transcription_id, quality,
 			transport, source_ip, codec, sample_rate, participant_count,
 			stream_count, status, error_message, billing_code, cost_center,
 			vendor_type, ucid, oracle_ucid, conversation_id, cisco_session_id,
 			created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	_, err := r.db.db.ExecContext(ctx, query,
 		cdr.ID, cdr.SessionID, cdr.CallID, cdr.CallerID, cdr.CalleeID,
+		cdr.CallerIDName, cdr.CalleeIDName,
 		cdr.StartTime, cdr.EndTime, cdr.Duration, cdr.RecordingPath,
 		cdr.RecordingSize, cdr.TranscriptionID, cdr.Quality, cdr.Transport,
 		cdr.SourceIP, cdr.Codec, cdr.SampleRate, cdr.ParticipantCount,
@@ -1234,7 +1236,7 @@ func (r *Repository) GetCDRByCallID(callID string) (*CDR, error) {
 	ctx, cancel := r.db.getContext()
 	defer cancel()
 
-	query := `SELECT id, session_id, call_id, caller_id, callee_id, start_time, end_time, duration,
+	query := `SELECT id, session_id, call_id, caller_id, callee_id, caller_id_name, callee_id_name, start_time, end_time, duration,
 	recording_path, recording_size, transcription_id, quality, transport, source_ip, codec, sample_rate,
 	participant_count, stream_count, status, error_message, billing_code, cost_center, created_at, updated_at
 	FROM cdr WHERE call_id = ? LIMIT 1`
@@ -1244,6 +1246,8 @@ func (r *Repository) GetCDRByCallID(callID string) (*CDR, error) {
 	var (
 		callerID      sql.NullString
 		calleeID      sql.NullString
+		callerIDName  sql.NullString
+		calleeIDName  sql.NullString
 		endTime       sql.NullTime
 		duration      sql.NullInt64
 		recordingPath sql.NullString
@@ -1263,6 +1267,8 @@ func (r *Repository) GetCDRByCallID(callID string) (*CDR, error) {
 		&cdr.CallID,
 		&callerID,
 		&calleeID,
+		&callerIDName,
+		&calleeIDName,
 		&cdr.StartTime,
 		&endTime,
 		&duration,
@@ -1294,6 +1300,12 @@ func (r *Repository) GetCDRByCallID(callID string) (*CDR, error) {
 	}
 	if calleeID.Valid {
 		cdr.CalleeID = &calleeID.String
+	}
+	if callerIDName.Valid {
+		cdr.CallerIDName = &callerIDName.String
+	}
+	if calleeIDName.Valid {
+		cdr.CalleeIDName = &calleeIDName.String
 	}
 	if endTime.Valid {
 		cdr.EndTime = &endTime.Time

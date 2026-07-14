@@ -1366,6 +1366,48 @@ func (s *CustomSIPServer) handleSiprecInvite(message *SIPMessage) {
 					update.ParticipantCount = &pc
 					hasUpdates = true
 				}
+				// Populate caller/callee identities from SIPREC participants.
+				caller, callee := deriveCallerCallee(recordingSession.Participants)
+				// Diagnostic: dump what the parser extracted so we can see exactly
+				// what FreeSWITCH sent when caller/callee come out empty.
+				partDump := make([]map[string]interface{}, 0, len(recordingSession.Participants))
+				for _, p := range recordingSession.Participants {
+					commIDs := make([]string, 0, len(p.CommunicationIDs))
+					for _, c := range p.CommunicationIDs {
+						commIDs = append(commIDs, fmt.Sprintf("%s=%s(disp=%q,prio=%d)", c.Type, c.Value, c.DisplayName, c.Priority))
+					}
+					partDump = append(partDump, map[string]interface{}{
+						"id":           p.ID,
+						"role":         p.Role,
+						"name":         p.Name,
+						"display_name": p.DisplayName,
+						"calling":      p.CallingParty,
+						"called":       p.CalledParty,
+						"comm_ids":     commIDs,
+					})
+				}
+				logger.WithFields(logrus.Fields{
+					"participant_count": len(recordingSession.Participants),
+					"derived_caller":    caller,
+					"derived_callee":    callee,
+					"participants":      partDump,
+				}).Info("CDR caller/callee derivation from SIPREC participants")
+				callerName, calleeName := deriveCallerCalleeNames(recordingSession.Participants)
+				if caller != "" || callee != "" {
+					if caller != "" {
+						update.CallerID = &caller
+					}
+					if callee != "" {
+						update.CalleeID = &callee
+					}
+					if callerName != "" {
+						update.CallerIDName = &callerName
+					}
+					if calleeName != "" {
+						update.CalleeIDName = &calleeName
+					}
+					hasUpdates = true
+				}
 				if sc := len(recordingSession.MediaStreamTypes); sc > 0 {
 					update.StreamCount = &sc
 					hasUpdates = true
@@ -2628,6 +2670,23 @@ func (s *CustomSIPServer) updateRecordingSession(session *siprec.RecordingSessio
 				update.StreamCount = &sc
 				hasUpdates = true
 			}
+			// Refresh caller/callee identities from updated participants.
+			if caller, callee := deriveCallerCallee(session.Participants); caller != "" || callee != "" {
+				if caller != "" {
+					update.CallerID = &caller
+				}
+				if callee != "" {
+					update.CalleeID = &callee
+				}
+				callerName, calleeName := deriveCallerCalleeNames(session.Participants)
+				if callerName != "" {
+					update.CallerIDName = &callerName
+				}
+				if calleeName != "" {
+					update.CalleeIDName = &calleeName
+				}
+				hasUpdates = true
+			}
 			if hasUpdates {
 				if err := svc.UpdateSession(session.ID, update); err != nil {
 					logger.WithError(err).Warn("Failed to update CDR session after metadata refresh")
@@ -3855,6 +3914,25 @@ func (s *CustomSIPServer) doFinalizeCall(callID string, callState *CallState, re
 			if status == "failed" && reason != "" {
 				errMsg = &reason
 			}
+
+			// Record the on-disk recording location in the CDR. Prefer the
+			// combined multi-leg file when one was produced; otherwise fall
+			// back to the first captured leg. recordingLegs is still in scope
+			// here even though the forwarders themselves were already cleaned
+			// up above.
+			recordingPath := ""
+			if callState.RecordingSession.ExtendedMetadata != nil {
+				recordingPath = callState.RecordingSession.ExtendedMetadata["combined_recording_path"]
+			}
+			if recordingPath == "" && len(recordingLegs) > 0 {
+				recordingPath = recordingLegs[0].Path
+			}
+			if recordingPath != "" {
+				if err := svc.UpdateSession(callState.RecordingSession.ID, cdr.CDRUpdate{RecordingPath: &recordingPath}); err != nil {
+					s.logger.WithError(err).WithField("session_id", callState.RecordingSession.ID).Debug("Failed to set CDR recording path")
+				}
+			}
+
 			if err := svc.EndSession(callState.RecordingSession.ID, status, errMsg); err != nil {
 				s.logger.WithError(err).WithField("session_id", callState.RecordingSession.ID).Warn("Failed to record CDR for terminated session")
 			}
@@ -4021,6 +4099,113 @@ func sessionIDFromState(callState *CallState) string {
 		return callState.RecordingSession.ID
 	}
 	return ""
+}
+
+// participantIdentity returns the best available identity string for a
+// participant, preferring the primary AOR/communication ID (e.g.
+// "sip:1001@example.com") and falling back to the participant name.
+func participantIdentity(p siprec.Participant) string {
+	// Prefer the highest-priority communication ID with a value.
+	best := ""
+	bestPriority := int(^uint(0) >> 1) // max int
+	for _, comm := range p.CommunicationIDs {
+		value := strings.TrimSpace(comm.Value)
+		if value == "" {
+			continue
+		}
+		if best == "" || comm.Priority < bestPriority {
+			best = value
+			bestPriority = comm.Priority
+		}
+	}
+	if best != "" {
+		return best
+	}
+	if name := strings.TrimSpace(p.Name); name != "" {
+		return name
+	}
+	return strings.TrimSpace(p.DisplayName)
+}
+
+// deriveCallerCallee inspects the recording session participants and returns
+// the caller and callee identities (AOR/URI). SIPREC participants carry a Role
+// (RFC 7866: "caller"/"callee", or the SDP-oriented "active"/"passive") which we
+// use to classify the two sides. When roles are absent or ambiguous, we fall
+// back to participant order (first = caller, second = callee).
+func deriveCallerCallee(participants []siprec.Participant) (caller, callee string) {
+	callerIdx, calleeIdx := selectCallerCallee(participants)
+	if callerIdx >= 0 {
+		caller = participantIdentity(participants[callerIdx])
+	}
+	if calleeIdx >= 0 {
+		callee = participantIdentity(participants[calleeIdx])
+	}
+	return caller, callee
+}
+
+// deriveCallerCalleeNames returns the display names of the caller and callee
+// participants, selected with the same role/order logic as deriveCallerCallee so
+// the names line up with the identities. Either value may be empty when the
+// participant carries no display name.
+func deriveCallerCalleeNames(participants []siprec.Participant) (callerName, calleeName string) {
+	callerIdx, calleeIdx := selectCallerCallee(participants)
+	if callerIdx >= 0 {
+		callerName = participantName(participants[callerIdx])
+	}
+	if calleeIdx >= 0 {
+		calleeName = participantName(participants[calleeIdx])
+	}
+	return callerName, calleeName
+}
+
+// selectCallerCallee returns the indices of the caller and callee participants
+// (or -1 when unresolved). It classifies by RFC 7866 role / calling-called flags
+// first, then falls back to participant order for anything the role scan didn't
+// resolve. Only participants with a resolvable identity are eligible.
+func selectCallerCallee(participants []siprec.Participant) (callerIdx, calleeIdx int) {
+	callerIdx, calleeIdx = -1, -1
+	for i, p := range participants {
+		role := strings.ToLower(strings.TrimSpace(p.Role))
+		if participantIdentity(p) == "" {
+			continue
+		}
+		switch {
+		case callerIdx == -1 && (strings.Contains(role, "caller") || p.CallingParty):
+			callerIdx = i
+		case calleeIdx == -1 && (strings.Contains(role, "callee") || strings.Contains(role, "called") || p.CalledParty):
+			calleeIdx = i
+		}
+	}
+
+	// Fall back to participant order for anything the role scan didn't resolve.
+	if callerIdx == -1 || calleeIdx == -1 {
+		for i, p := range participants {
+			if participantIdentity(p) == "" {
+				continue
+			}
+			if i == callerIdx || i == calleeIdx {
+				continue
+			}
+			if callerIdx == -1 {
+				callerIdx = i
+			} else if calleeIdx == -1 {
+				calleeIdx = i
+			} else {
+				break
+			}
+		}
+	}
+
+	return callerIdx, calleeIdx
+}
+
+// participantName returns the human-readable display name for a participant,
+// preferring the explicit DisplayName and falling back to Name.
+func participantName(p siprec.Participant) string {
+	if name := strings.TrimSpace(p.DisplayName); name != "" {
+		return name
+	}
+	return strings.TrimSpace(p.Name)
 }
 
 // getHeaderValue gets a header value from the message

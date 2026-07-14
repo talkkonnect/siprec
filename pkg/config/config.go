@@ -1289,18 +1289,13 @@ type RateLimitConfig struct {
 
 // Load loads the configuration from a config file, environment variables, or .env file
 // Priority order: config file (YAML/JSON) > environment variables > .env file > defaults
-func Load(logger *logrus.Logger) (*Config, error) {
-	// Check for config file first (production mode)
-	configFile := FindConfigFile()
-	if configFile != "" {
-		logger.WithField("config_file", configFile).Info("Loading configuration from file")
-		return LoadFromFile(logger, configFile)
-	}
-
-	// Fall back to .env / environment variables (development mode)
-	logger.Debug("No config file found, using .env/environment variables")
-
-	// Get current working directory
+// loadDotEnvFiles loads a .env file (if present) into the process environment.
+// It is invoked in both file-based and env-based configuration modes so that
+// environment-driven settings and secrets (e.g. DATABASE_ENABLED, DB_*) are
+// available regardless of whether a config.yaml is used. godotenv does not
+// override variables that are already set, so real environment variables keep
+// precedence over the .env file.
+func loadDotEnvFiles(logger *logrus.Logger) {
 	wd, err := os.Getwd()
 	if err != nil {
 		logger.WithError(err).Warn("Failed to get current working directory")
@@ -1314,41 +1309,44 @@ func Load(logger *logrus.Logger) (*Config, error) {
 		filepath.Join(wd, ".env"), // Absolute path
 	}
 
-	// Try loading .env file from each possible location
 	var loadedFrom string
-	var loadErr error
-
 	for _, envFile := range possibleEnvFiles {
-		// Try to load this .env file
 		if _, statErr := os.Stat(envFile); statErr == nil {
 			absPath, _ := filepath.Abs(envFile)
 			logger.WithField("path", absPath).Debug("Attempting to load .env file")
 
-			if loadErr = godotenv.Load(envFile); loadErr == nil {
+			if loadErr := godotenv.Load(envFile); loadErr == nil {
 				loadedFrom = absPath
 				break
 			}
 		}
 	}
 
-	// If all attempts failed, try default Load() which uses working directory
-	if loadedFrom == "" {
-		if loadErr = godotenv.Load(); loadErr == nil {
-			if _, statErr := os.Stat(".env"); statErr == nil {
-				loadedFrom, _ = filepath.Abs(".env")
-			}
-		}
-	}
-
-	// Report results
 	if loadedFrom != "" {
 		logger.WithFields(logrus.Fields{
 			"working_dir": wd,
 			"path":        loadedFrom,
 		}).Info("Successfully loaded .env file")
 	} else {
-		logger.WithField("working_dir", wd).Warn("No .env file found, using environment variables only")
+		logger.WithField("working_dir", wd).Debug("No .env file found, using environment variables only")
 	}
+}
+
+func Load(logger *logrus.Logger) (*Config, error) {
+	// Load .env (if present) before anything else so environment-based
+	// settings and secrets are available in both file-based and env-based
+	// configuration modes.
+	loadDotEnvFiles(logger)
+
+	// Check for config file first (production mode)
+	configFile := FindConfigFile()
+	if configFile != "" {
+		logger.WithField("config_file", configFile).Info("Loading configuration from file")
+		return LoadFromFile(logger, configFile)
+	}
+
+	// Fall back to .env / environment variables (development mode)
+	logger.Debug("No config file found, using .env/environment variables")
 
 	// Initialize config with default values
 	config := &Config{}

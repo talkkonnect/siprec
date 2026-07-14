@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -125,13 +126,137 @@ func (m *MySQLDatabase) Migrate() error {
 	for i, migration := range migrations {
 		m.logger.WithField("migration", i+1).Debug("Running migration")
 
-		if _, err := m.db.Exec(migration); err != nil {
-			return fmt.Errorf("migration %d failed: %w", i+1, err)
+		// A single migration string may contain multiple SQL statements.
+		// The MySQL driver does not permit multiple statements in one Exec
+		// unless multiStatements is enabled (which we intentionally leave
+		// off), so split and execute each statement individually.
+		for _, stmt := range splitSQLStatements(migration) {
+			if _, err := m.db.Exec(stmt); err != nil {
+				return fmt.Errorf("migration %d failed: %w", i+1, err)
+			}
 		}
+	}
+
+	// Post-schema fixups for databases created by older versions.
+	if err := m.dropLegacyCDRSessionFK(); err != nil {
+		return fmt.Errorf("dropping legacy cdr foreign key failed: %w", err)
+	}
+
+	// Add caller/callee display-name columns to CDR tables created before these
+	// columns existed (CREATE TABLE IF NOT EXISTS won't alter an existing table).
+	if err := m.addCDRDisplayNameColumns(); err != nil {
+		return fmt.Errorf("adding cdr display-name columns failed: %w", err)
 	}
 
 	m.logger.Info("Database migrations completed successfully")
 	return nil
+}
+
+// dropLegacyCDRSessionFK removes the cdr -> sessions foreign key that older
+// schema versions created. The application never populates the sessions table
+// in the recording path, so this FK caused every CDR insert to fail with
+// MySQL error 1452. Fresh installs no longer create the FK (see
+// createCDRTable); this handles databases migrated from the older schema.
+// It is idempotent: if no such FK exists it is a no-op.
+func (m *MySQLDatabase) dropLegacyCDRSessionFK() error {
+	ctx, cancel := m.getContext()
+	defer cancel()
+
+	// Look up the actual constraint name (it may not be the default
+	// "cdr_ibfk_1" depending on how the table was created).
+	var constraintName string
+	err := m.db.QueryRowContext(ctx, `
+		SELECT CONSTRAINT_NAME
+		FROM information_schema.KEY_COLUMN_USAGE
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = 'cdr'
+		  AND COLUMN_NAME = 'session_id'
+		  AND REFERENCED_TABLE_NAME = 'sessions'
+		LIMIT 1
+	`).Scan(&constraintName)
+	if err == sql.ErrNoRows {
+		return nil // No legacy FK present.
+	}
+	if err != nil {
+		return fmt.Errorf("failed to inspect cdr foreign keys: %w", err)
+	}
+
+	// Constraint name comes from information_schema, not user input, but it is
+	// an identifier so it cannot be parameterized; interpolate it directly.
+	if _, err := m.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE cdr DROP FOREIGN KEY `%s`", constraintName)); err != nil {
+		return fmt.Errorf("failed to drop cdr foreign key %q: %w", constraintName, err)
+	}
+
+	m.logger.WithField("constraint", constraintName).Info("Dropped legacy cdr->sessions foreign key")
+	return nil
+}
+
+// addCDRDisplayNameColumns adds the caller_id_name and callee_id_name columns to
+// the cdr table for databases created before they existed. CREATE TABLE IF NOT
+// EXISTS never alters an existing table, so older installs need this explicit
+// ALTER. It is idempotent: columns that already exist are skipped.
+func (m *MySQLDatabase) addCDRDisplayNameColumns() error {
+	ctx, cancel := m.getContext()
+	defer cancel()
+
+	columns := []struct {
+		name string
+		ddl  string
+	}{
+		{"caller_id_name", "ALTER TABLE cdr ADD COLUMN caller_id_name VARCHAR(255) NULL AFTER callee_id"},
+		{"callee_id_name", "ALTER TABLE cdr ADD COLUMN callee_id_name VARCHAR(255) NULL AFTER caller_id_name"},
+	}
+
+	for _, col := range columns {
+		var exists int
+		err := m.db.QueryRowContext(ctx, `
+			SELECT COUNT(*)
+			FROM information_schema.COLUMNS
+			WHERE TABLE_SCHEMA = DATABASE()
+			  AND TABLE_NAME = 'cdr'
+			  AND COLUMN_NAME = ?
+		`, col.name).Scan(&exists)
+		if err != nil {
+			return fmt.Errorf("failed to inspect cdr column %q: %w", col.name, err)
+		}
+		if exists > 0 {
+			continue
+		}
+		if _, err := m.db.ExecContext(ctx, col.ddl); err != nil {
+			return fmt.Errorf("failed to add cdr column %q: %w", col.name, err)
+		}
+		m.logger.WithField("column", col.name).Info("Added cdr display-name column")
+	}
+
+	return nil
+}
+
+// splitSQLStatements splits a migration blob into individual executable
+// statements. Full-line SQL comments ("-- ...") are stripped FIRST, then the
+// remainder is split on ";" and empty fragments are dropped. Stripping
+// comments before splitting is important: a ";" inside a comment must not be
+// treated as a statement terminator. The schema definitions contain no
+// semicolons inside string literals, so splitting the comment-free text is
+// safe.
+func splitSQLStatements(blob string) []string {
+	// Remove full-line comments and blank lines up front.
+	var kept []string
+	for _, line := range strings.Split(blob, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "--") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+
+	var stmts []string
+	for _, part := range strings.Split(strings.Join(kept, "\n"), ";") {
+		stmt := strings.TrimSpace(part)
+		if stmt != "" {
+			stmts = append(stmts, stmt)
+		}
+	}
+	return stmts
 }
 
 // getContext returns a context with timeout
@@ -223,6 +348,8 @@ CREATE TABLE IF NOT EXISTS cdr (
     call_id VARCHAR(255) NOT NULL,
     caller_id VARCHAR(255) NULL,
     callee_id VARCHAR(255) NULL,
+    caller_id_name VARCHAR(255) NULL,
+    callee_id_name VARCHAR(255) NULL,
     start_time TIMESTAMP NOT NULL,
     end_time TIMESTAMP NULL,
     duration BIGINT NULL,
@@ -247,7 +374,11 @@ CREATE TABLE IF NOT EXISTS cdr (
     cisco_session_id VARCHAR(255) NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+    -- NOTE: intentionally NO foreign key to sessions(id). The CDR is a
+    -- self-contained call record and the recording path does not populate
+    -- the sessions table, so an FK here caused every CDR insert to fail with
+    -- error 1452. session_id is kept (and indexed) as a soft reference only.
+    -- (Keep this comment free of semicolons -- migrations split on ';'.)
     INDEX idx_session_id (session_id),
     INDEX idx_call_id (call_id),
     INDEX idx_caller_id (caller_id),
