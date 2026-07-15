@@ -588,6 +588,93 @@ func (r *Repository) CreateCDR(cdr *CDR) error {
 	return nil
 }
 
+// SIP message operations
+
+// CreateSIPMessage stores one captured SIP request/response.
+func (r *Repository) CreateSIPMessage(m *SIPMessage) error {
+	ctx, cancel := r.db.getContext()
+	defer cancel()
+
+	if m.Timestamp.IsZero() {
+		m.Timestamp = time.Now()
+	}
+	query := `
+		INSERT INTO sip_messages (
+			call_id, session_id, seq, ts, direction, method, status_code,
+			cseq_method, from_uri, to_uri, src_addr, dst_addr, raw
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err := r.db.db.ExecContext(ctx, query,
+		m.CallID, m.SessionID, m.Seq, m.Timestamp, m.Direction, m.Method,
+		m.StatusCode, m.CSeqMethod, m.FromURI, m.ToURI, m.SrcAddr, m.DstAddr, m.Raw,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create sip message: %w", err)
+	}
+	return nil
+}
+
+// GetSIPMessagesByCallID returns all captured SIP messages for a call, ordered
+// chronologically (ties broken by capture sequence).
+func (r *Repository) GetSIPMessagesByCallID(callID string) ([]*SIPMessage, error) {
+	ctx, cancel := r.db.getContext()
+	defer cancel()
+
+	query := `
+		SELECT id, call_id, session_id, seq, ts, direction, method, status_code,
+		       cseq_method, from_uri, to_uri, src_addr, dst_addr, raw, created_at
+		FROM sip_messages WHERE call_id = ? ORDER BY ts ASC, seq ASC
+	`
+	rows, err := r.db.db.QueryContext(ctx, query, callID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query sip messages: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*SIPMessage
+	for rows.Next() {
+		m := &SIPMessage{}
+		var sessionID, method, cseq, fromURI, toURI, src, dst, raw sql.NullString
+		var statusCode sql.NullInt64
+		if err := rows.Scan(
+			&m.ID, &m.CallID, &sessionID, &m.Seq, &m.Timestamp, &m.Direction,
+			&method, &statusCode, &cseq, &fromURI, &toURI, &src, &dst, &raw, &m.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan sip message row: %w", err)
+		}
+		if sessionID.Valid {
+			m.SessionID = &sessionID.String
+		}
+		if method.Valid {
+			m.Method = &method.String
+		}
+		if statusCode.Valid {
+			v := int(statusCode.Int64)
+			m.StatusCode = &v
+		}
+		if cseq.Valid {
+			m.CSeqMethod = &cseq.String
+		}
+		if fromURI.Valid {
+			m.FromURI = &fromURI.String
+		}
+		if toURI.Valid {
+			m.ToURI = &toURI.String
+		}
+		if src.Valid {
+			m.SrcAddr = &src.String
+		}
+		if dst.Valid {
+			m.DstAddr = &dst.String
+		}
+		if raw.Valid {
+			m.Raw = &raw.String
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
 // Event operations
 
 // CreateEvent creates a new event record
@@ -1395,6 +1482,10 @@ func (r *Repository) DeleteCallData(callID string) error {
 		}
 	}
 
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sip_messages WHERE call_id = ?`, callID); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to delete sip messages: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM cdr WHERE call_id = ?`, callID); err != nil {
 		tx.Rollback()
 		return fmt.Errorf("failed to delete cdr: %w", err)

@@ -83,6 +83,7 @@ var (
 	dbConn              *database.MySQLDatabase
 	dbRepo              *database.Repository
 	cdrService          *cdr.CDRService
+	sipRecorder         *sip.SIPRecorder
 	gdprService         *compliance.GDPRService
 	cbManager           *circuitbreaker.Manager
 	perfMonitor         *performance.PerformanceMonitor
@@ -377,6 +378,13 @@ func main() {
 			logger.Info("CDR service stopped")
 		}
 
+		// Flush any buffered SIP messages before closing the database.
+		if sipRecorder != nil {
+			logger.Debug("Stopping SIP message capture...")
+			sipRecorder.Close()
+			logger.Info("SIP message capture stopped")
+		}
+
 		if dbConnLocal != nil {
 			logger.Debug("Closing database connection...")
 			if err := dbConnLocal.Close(); err != nil {
@@ -651,6 +659,8 @@ func initialize() error {
 			logger.Info("Database connection established")
 			cdrService = cdr.NewCDRService(dbRepo, cdr.CDRConfig{}, logger)
 			logger.Info("CDR service initialized")
+			sipRecorder = sip.NewSIPRecorder(dbRepo, logger)
+			logger.Info("SIP message capture initialized")
 		}
 	} else {
 		logger.Debug("Database persistence disabled by configuration")
@@ -1379,6 +1389,10 @@ func initialize() error {
 
 	if cdrService != nil {
 		sipHandler.SetCDRService(cdrService)
+	}
+
+	if sipRecorder != nil {
+		sipHandler.SetSIPRecorder(sipRecorder)
 	}
 
 	if analyticsDispatcher != nil {

@@ -152,6 +152,28 @@ type CDR struct {
 	UpdatedAt        time.Time `db:"updated_at" json:"updated_at"`
 }
 
+// SIPMessage is a single captured SIP request or response for a call, stored so
+// the real signaling ladder (INVITE/100/180/200/ACK/BYE …) can be reconstructed
+// later. Correlated to a call by CallID (the sessions table is not populated in
+// the recording path).
+type SIPMessage struct {
+	ID         int64     `db:"id" json:"id"`
+	CallID     string    `db:"call_id" json:"call_id"`
+	SessionID  *string   `db:"session_id" json:"session_id,omitempty"`
+	Seq        int       `db:"seq" json:"seq"` // per-call capture order (tiebreaker for equal timestamps)
+	Timestamp  time.Time `db:"ts" json:"timestamp"`
+	Direction  string    `db:"direction" json:"direction"`               // recv (inbound to SRS) | send (outbound from SRS)
+	Method     *string   `db:"method" json:"method,omitempty"`           // request method, nil for responses
+	StatusCode *int      `db:"status_code" json:"status_code,omitempty"` // response status, nil for requests
+	CSeqMethod *string   `db:"cseq_method" json:"cseq_method,omitempty"`
+	FromURI    *string   `db:"from_uri" json:"from_uri,omitempty"`
+	ToURI      *string   `db:"to_uri" json:"to_uri,omitempty"`
+	SrcAddr    *string   `db:"src_addr" json:"src_addr,omitempty"` // ip:port
+	DstAddr    *string   `db:"dst_addr" json:"dst_addr,omitempty"` // ip:port
+	Raw        *string   `db:"raw" json:"raw,omitempty"`           // full serialized message
+	CreatedAt  time.Time `db:"created_at" json:"created_at"`
+}
+
 // Event represents system events for auditing
 type Event struct {
 	ID        string                 `db:"id" json:"id"`

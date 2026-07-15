@@ -677,6 +677,9 @@ func extractContactParameters(contact string) string {
 func (s *CustomSIPServer) handleTransactionRequest(req *sipparser.Request, tx sipparser.ServerTransaction, method string) {
 	message := s.wrapRequest(req, tx)
 
+	// Persist the inbound request for the call's SIP flow (best-effort, async).
+	s.captureInboundRequest(message)
+
 	switch strings.ToUpper(method) {
 	case "INVITE":
 		s.handleInviteMessage(message)
@@ -3593,7 +3596,11 @@ func (s *CustomSIPServer) sendResponse(message *SIPMessage, statusCode int, reas
 			"method":  message.Method,
 			"status":  statusCode,
 		}).Error("Failed to send SIP response over transaction layer")
+		return
 	}
+
+	// Persist the outbound response for the call's SIP flow (best-effort, async).
+	s.captureOutboundResponse(message, resp)
 }
 
 // registerRTPStreamInCluster registers an RTP stream with the cluster orchestrator.

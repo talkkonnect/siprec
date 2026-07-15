@@ -120,6 +120,7 @@ func (m *MySQLDatabase) Migrate() error {
 		createUsersTable,
 		createAPIKeysTable,
 		createSearchIndexTable,
+		createSIPMessagesTable,
 		createIndexes,
 	}
 
@@ -495,6 +496,27 @@ CREATE TABLE IF NOT EXISTS search_index (
     INDEX idx_type (type),
     INDEX idx_entity_id (entity_id),
     FULLTEXT(content)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+`
+
+const createSIPMessagesTable = `
+CREATE TABLE IF NOT EXISTS sip_messages (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    call_id VARCHAR(255) NOT NULL,
+    session_id VARCHAR(36) NULL,
+    seq INT NOT NULL DEFAULT 0,
+    ts TIMESTAMP(6) NOT NULL,
+    direction ENUM('recv', 'send') NOT NULL,
+    method VARCHAR(32) NULL,
+    status_code INT NULL,
+    cseq_method VARCHAR(32) NULL,
+    from_uri VARCHAR(255) NULL,
+    to_uri VARCHAR(255) NULL,
+    src_addr VARCHAR(64) NULL,
+    dst_addr VARCHAR(64) NULL,
+    raw MEDIUMTEXT NULL,
+    created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    INDEX idx_sipmsg_call (call_id, ts, seq)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 `
 

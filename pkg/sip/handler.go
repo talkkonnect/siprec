@@ -154,6 +154,7 @@ type Handler struct {
 
 	analyticsDispatcher *analytics.Dispatcher
 	cdrService          *cdr.CDRService
+	sipRecorder         *SIPRecorder
 	sttManager          *stt.ProviderManager
 	clusterManager      *cluster.Manager
 
@@ -417,6 +418,16 @@ func (h *Handler) SetCDRService(service *cdr.CDRService) {
 // CDRService returns the configured CDR service.
 func (h *Handler) CDRService() *cdr.CDRService {
 	return h.cdrService
+}
+
+// SetSIPRecorder registers the recorder that persists captured SIP messages.
+func (h *Handler) SetSIPRecorder(r *SIPRecorder) {
+	h.sipRecorder = r
+}
+
+// SIPRecorder returns the configured SIP message recorder (nil when disabled).
+func (h *Handler) SIPRecorder() *SIPRecorder {
+	return h.sipRecorder
 }
 
 // AuthenticateRequest checks if a SIP request is authenticated
@@ -850,6 +861,25 @@ func (h *Handler) GetSession(id string) (interface{}, error) {
 				"media_types":  callData.RecordingSession.MediaStreamTypes,
 			}
 
+			// Caller/callee identities derived from the SIPREC participants (same
+			// derivation used for the CDR), so live sessions show who is on the call.
+			if caller, callee := deriveCallerCallee(callData.RecordingSession.Participants); caller != "" || callee != "" {
+				if caller != "" {
+					recordingInfo["caller_id"] = caller
+				}
+				if callee != "" {
+					recordingInfo["callee_id"] = callee
+				}
+			}
+			if callerName, calleeName := deriveCallerCalleeNames(callData.RecordingSession.Participants); callerName != "" || calleeName != "" {
+				if callerName != "" {
+					recordingInfo["caller_id_name"] = callerName
+				}
+				if calleeName != "" {
+					recordingInfo["callee_id_name"] = calleeName
+				}
+			}
+
 			// Add vendor-specific metadata if available
 			if callData.RecordingSession.ExtendedMetadata != nil {
 				extMeta := callData.RecordingSession.ExtendedMetadata
@@ -911,6 +941,23 @@ func (h *Handler) GetSession(id string) (interface{}, error) {
 					"session_id": storedData.RecordingSession.ID,
 					"state":      storedData.RecordingSession.RecordingState,
 					"start_time": storedData.RecordingSession.StartTime,
+				}
+
+				if caller, callee := deriveCallerCallee(storedData.RecordingSession.Participants); caller != "" || callee != "" {
+					if caller != "" {
+						recordingInfo["caller_id"] = caller
+					}
+					if callee != "" {
+						recordingInfo["callee_id"] = callee
+					}
+				}
+				if callerName, calleeName := deriveCallerCalleeNames(storedData.RecordingSession.Participants); callerName != "" || calleeName != "" {
+					if callerName != "" {
+						recordingInfo["caller_id_name"] = callerName
+					}
+					if calleeName != "" {
+						recordingInfo["callee_id_name"] = calleeName
+					}
 				}
 
 				// Add vendor-specific metadata
